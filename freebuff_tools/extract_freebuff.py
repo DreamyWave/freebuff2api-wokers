@@ -62,7 +62,7 @@ def tg_configured():
 
 
 def send_tg(text):
-    """推送文本到 Telegram，失败返回 False。"""
+    """推送文本到 Telegram，失败返回 False（错误描述打印到 stderr，便于定位）。"""
     token = os.environ.get("TG_BOT_TOKEN")
     chat = os.environ.get("TG_CHAT_ID")
     if not token or not chat:
@@ -74,7 +74,18 @@ def send_tg(text):
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read().decode() or "{}")
-            return bool(data.get("ok", True))
+            if not data.get("ok", True):
+                print(f"   ⚠️ TG API 错误: {data.get('description', data)}")
+                return False
+            return True
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read().decode() or "{}")
+            desc = err.get("description", str(e))
+        except Exception:
+            desc = str(e)
+        print(f"   ⚠️ TG 发送失败: {desc}")
+        return False
     except Exception as e:
         print(f"   ⚠️ TG 发送失败: {e}")
         return False
@@ -179,7 +190,10 @@ def cmd_login(args):
 
     status, data, _ = _http("POST", "/api/auth/cli/code", {"fingerprintId": fingerprint_id})
     if status != 200 or not data:
-        print(f"❌ 请求登录 URL 失败: HTTP {status} {data}")
+        msg = f"❌ 请求登录 URL 失败: HTTP {status} {data}"
+        print(msg)
+        if use_tg:
+            send_tg("⚠️ Freebuff 提取失败：\n" + msg)
         sys.exit(1)
 
     login_url = data["loginUrl"]
@@ -188,11 +202,20 @@ def cmd_login(args):
     # loginUrl 含一次性 auth_code，CI 里掩码，避免暴露到日志
     mask_value(login_url)
 
+    # 可选的轮询超时覆盖（对齐 cline_oauth.py：workflow 的 poll_timeout 传进来）
+    poll_timeout = POLL_TIMEOUT
+    env_timeout = os.environ.get("OAUTH_POLL_TIMEOUT")
+    if env_timeout:
+        try:
+            poll_timeout = int(env_timeout)
+        except ValueError:
+            pass
+
     print("=" * 60)
     print("1️⃣  在浏览器打开下面这个链接：")
     print(f"    {login_url}")
     print("2️⃣  用 Google 账号登录并授权")
-    print("3️⃣  脚本自动轮询等待，最多 5 分钟")
+    print(f"3️⃣  脚本自动轮询等待，最多 {poll_timeout} 秒")
     print("=" * 60)
 
     # 把授权链接推送到 TG，方便在手机上完成授权
@@ -201,7 +224,7 @@ def cmd_login(args):
             "🔑 *Freebuff 授权请求*\n\n"
             "请在浏览器打开下面链接并完成登录：\n"
             f"{login_url}\n\n"
-            "脚本将自动轮询等待，最多 5 分钟。"
+            f"脚本将自动轮询等待，最多 {poll_timeout} 秒。"
         )
         ok = send_tg(tg_msg)
         if not ok:
@@ -211,10 +234,10 @@ def cmd_login(args):
     else:
         print("ℹ️ 未配置 TG，授权链接仅在下方日志中显示。")
 
-    print(f"\n🔄 等待你授权（脚本自动轮询，最多 {POLL_TIMEOUT // 60} 分钟）...")
+    print(f"\n🔄 等待你授权（脚本自动轮询，最多 {poll_timeout} 秒）...")
     start = time.time()
     attempts = 0
-    while time.time() - start < POLL_TIMEOUT:
+    while time.time() - start < poll_timeout:
         attempts += 1
         status, data, _ = _http(
             "GET", "/api/auth/cli/status",
@@ -270,7 +293,7 @@ def cmd_login(args):
             print(f"   [{int(time.time()-start)}s] 状态 {status}: {str(data)[:120]}")
         time.sleep(POLL_INTERVAL)
 
-    print("⏰ 等待登录超时（5 分钟），请重试。")
+    print("⏰ 等待登录超时，请重试。")
     sys.exit(1)
 
 
