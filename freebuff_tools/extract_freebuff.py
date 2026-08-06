@@ -1,25 +1,34 @@
 #!/usr/bin/env python3
-"""
-Freebuff authToken 提取工具（类似 cline 的提取）
-
-流程（与官方 CLI 一致）：
-  1. 生成设备指纹 fingerprintId
-  2. POST /api/auth/cli/code → 拿 Google 登录 URL + fingerprintHash + expiresAt
-  3. 用浏览器打开登录 URL，登录 Google 账号（可人工或自动化）
-  4. 轮询 GET /api/auth/cli/status → 成功拿到 user（含 authToken）
-  5. authToken 保存到本地，之后直接作为 Bearer 调模型 API
+"""Freebuff 一键获取 authToken 脚本（授权码轮询流程，交互方式对齐 cline_oauth.py）。
 
 用法：
-  python3 extract_freebuff.py login           # 开始登录，打印 URL 并轮询
-  python3 extract_freebuff.py show            # 显示已保存的凭证
+  python3 extract_freebuff.py login           # 开始登录（授权链接推 TG + 轮询拿 token）
+  python3 extract_freebuff.py tgsend          # 测试 TG 连通性（发一条测试消息）
+  python3 extract_freebuff.py show            # 显示已保存的凭证（脱敏）
   python3 extract_freebuff.py session         # 测试开 session（POST）
   python3 extract_freebuff.py chat [消息]     # 发一条消息测试模型 API
   python3 extract_freebuff.py quota           # 查用量 /api/v1/usage
 
-环境变量：
-  FREEBUFF_TOKEN   手动指定 authToken（跳过 credentials 文件）
-"""
+流程（与官方 CLI 一致）：
+  1. 生成设备指纹 fingerprintId
+  2. POST https://www.codebuff.com/api/auth/cli/code → 拿 Google 登录 URL + fingerprintHash
+  3. 授权链接打印 + 推送 TG，用户在浏览器打开并登录（脚本自动轮询）
+  4. 轮询 /api/auth/cli/status → 成功拿到 user（含 authToken）
+  5. authToken 保存到本地 / 推送 TG，之后直接作为 Bearer 调模型 API
 
+GitHub Actions 里的安全行为（重要）：
+  * 配置了 TG_BOT_TOKEN / TG_CHAT_ID 时，授权链接与 authToken 一律推送到 Telegram，
+    **authToken 绝不打印到标准输出/日志**（即使误打印也会被 ::add-mask:: 打码）。
+  * 未配置 TG 时（本地手动跑），保持原样打印，方便直接查看。
+  * TG 推送失败时直接报错退出，绝不把 token 落到日志里。
+
+环境变量：
+  TG_BOT_TOKEN         Telegram Bot Token（可选；与 TG_CHAT_ID 一起配置才推送）
+  TG_CHAT_ID           Telegram 接收 chat_id（可选）
+  FREEBUFF_TOKEN       手动指定 authToken（跳过 credentials 文件）
+
+依赖：仅 Python 3 标准库，无需 pip 安装任何东西。
+"""
 import argparse
 import base64
 import json
@@ -27,7 +36,6 @@ import os
 import secrets
 import sys
 import time
-import uuid
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -42,27 +50,40 @@ MODEL_DEFAULT = "deepseek/deepseek-v4-flash"
 
 
 # ---------------------------------------------------------------------------
-# Telegram helper（可选：登录交互走 TG，让 Actions 日志不暴露 URL/token）
+# CI / Telegram helpers（对齐 cline_oauth.py 的交互方式）
 # ---------------------------------------------------------------------------
 
-def _tg_send(bot_token: str, chat_id: str, text: str) -> bool:
-    """通过 TG bot 发一条消息。失败返回 False（不抛异常）。"""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": "true",
-    }).encode()
-    req = urllib.request.Request(
-        url, data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-            return bool(data.get("ok"))
-    except Exception as e:
-        print(f"⚠️ TG 发送失败: {e}", file=sys.stderr)
+def in_ci():
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def tg_configured():
+    return bool(os.environ.get("TG_BOT_TOKEN") and os.environ.get("TG_CHAT_ID"))
+
+
+def send_tg(text):
+    """推送文本到 Telegram，失败返回 False。"""
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat = os.environ.get("TG_CHAT_ID")
+    if not token or not chat:
         return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    body = json.dumps({"chat_id": chat, "text": text}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode() or "{}")
+            return bool(data.get("ok", True))
+    except Exception as e:
+        print(f"   ⚠️ TG 发送失败: {e}")
+        return False
+
+
+def mask_value(value):
+    """在 CI 中把敏感值加入 GitHub Actions 日志掩码（即使误打出也被打码）。"""
+    if in_ci() and value:
+        print(f"::add-mask::{value}")
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +157,25 @@ def gen_fingerprint():
     return f"codebuff-cli-{rand}"
 
 
+def cmd_tgsend(args):
+    """测试 TG 连通性：发一条测试消息。"""
+    if not tg_configured():
+        print("❌ 未设置 TG_BOT_TOKEN / TG_CHAT_ID")
+        sys.exit(1)
+    ok = send_tg("✅ TG 连通性测试成功！\nFreebuff 提取工作流可以正常向你发消息。")
+    if ok:
+        print("✅ 测试消息已发送到 TG，请查收。")
+    else:
+        print("❌ TG 发送失败，请检查 TG_BOT_TOKEN / TG_CHAT_ID。")
+        sys.exit(1)
+
+
 def cmd_login(args):
+    # 交互方式：TG 配置了就推 TG；CI 环境强制要求 TG（workflow 第一步也会拦）
+    use_tg = tg_configured()
+
     fingerprint_id = args.fingerprint or gen_fingerprint()
-    print(f"🔑 fingerprintId: {fingerprint_id}")
+    print(f"🚀 启动 Freebuff 登录流程（fingerprintId: {fingerprint_id}）...\n")
 
     status, data, _ = _http("POST", "/api/auth/cli/code", {"fingerprintId": fingerprint_id})
     if status != 200 or not data:
@@ -148,34 +185,33 @@ def cmd_login(args):
     login_url = data["loginUrl"]
     fingerprint_hash = data["fingerprintHash"]
     expires_at = data["expiresAt"]
+    # loginUrl 含一次性 auth_code，CI 里掩码，避免暴露到日志
+    mask_value(login_url)
 
-    # TG 模式：URL 只发 TG，Actions 日志里绝不出现完整 URL/token
-    tg_token = os.environ.get("TG_BOT_TOKEN")
-    tg_chat = os.environ.get("TG_CHAT_ID")
-    use_tg = bool(tg_token and tg_chat)
+    print("=" * 60)
+    print("1️⃣  在浏览器打开下面这个链接：")
+    print(f"    {login_url}")
+    print("2️⃣  用 Google 账号登录并授权")
+    print("3️⃣  脚本自动轮询等待，最多 5 分钟")
+    print("=" * 60)
+
+    # 把授权链接推送到 TG，方便在手机上完成授权
     if use_tg:
-        ok = _tg_send(tg_token, tg_chat,
-                      f"🔑 Freebuff 登录授权（{fingerprint_id}）\n\n"
-                      f"请 5 分钟内用浏览器打开并登录：\n{login_url}\n\n"
-                      f"登录完成后我会自动拿到 token 并发回给你。")
+        tg_msg = (
+            "🔑 *Freebuff 授权请求*\n\n"
+            "请在浏览器打开下面链接并完成登录：\n"
+            f"{login_url}\n\n"
+            "脚本将自动轮询等待，最多 5 分钟。"
+        )
+        ok = send_tg(tg_msg)
         if not ok:
-            print("⚠️ TG_BOT_TOKEN/TG_CHAT_ID 已设置但发送失败，退回打印 URL")
-            use_tg = False
-        else:
-            print("📨 登录 URL 已发送到 TG，等待登录（每 5 秒轮询）…")
-    if not use_tg:
-        print(f"🌐 请用浏览器打开以下地址并登录 Google 账号（5 分钟内完成）:\n\n  {login_url}\n")
-        print("   提示: 也可以交给自动化浏览器处理，脚本每 5 秒轮询一次状态。\n")
+            print("❌ 授权链接推送 TG 失败（请检查 TG_BOT_TOKEN / TG_CHAT_ID）")
+            sys.exit(1)
+        print("📨 授权链接已推送到 Telegram。")
+    else:
+        print("ℹ️ 未配置 TG，授权链接仅在下方日志中显示。")
 
-    # 可选自动打开浏览器
-    if args.open:
-        try:
-            import webbrowser
-            webbrowser.open(login_url)
-            print("   (已在本地打开浏览器)")
-        except Exception as e:
-            print(f"   (自动打开失败: {e})")
-
+    print(f"\n🔄 等待你授权（脚本自动轮询，最多 {POLL_TIMEOUT // 60} 分钟）...")
     start = time.time()
     attempts = 0
     while time.time() - start < POLL_TIMEOUT:
@@ -194,20 +230,36 @@ def cmd_login(args):
                 print(f"⚠️ 返回 user 但没有 authToken: {json.dumps(user)[:300]}")
                 sys.exit(1)
             print(f"✅ 登录成功！（第 {attempts} 次轮询，{int(time.time()-start)}s）")
-            print(f"   user.id:    {user.get('id')}")
-            print(f"   email:      {user.get('email')}")
-            print(f"   credits:    {user.get('credits')}")
-            print(f"   authToken:  {user['authToken'][:20]}...（已截断）")
+
+            email = user.get("email", "unknown")
+            # 邮箱 / id 同样视为敏感信息：打码，避免进入 Actions 日志
+            mask_value(email)
+            mask_value(str(user.get("id", "")))
+            print(f"✅ 登录成功! 账号: {email}")
+
             save_credentials(user)
-            # TG 模式：token 完整值只发 TG，日志保持截断
+
+            # 关键安全点：CI + 配置了 TG 时，authToken 只推 TG，绝不打印到日志
+            auth_token = user["authToken"]
             if use_tg:
-                _tg_send(tg_token, tg_chat,
-                         f"✅ Freebuff 登录成功！\n\n"
-                         f"email: {user.get('email')}\n"
-                         f"id: {user.get('id')}\n"
-                         f"credits: {user.get('credits')}\n\n"
-                         f"authToken（完整）：\n`{user['authToken']}`\n\n"
-                         f"请在 CF Worker 的 Secrets 里设置 FREEBUFF_TOKEN。")
+                mask_value(auth_token)  # 兜底：即使万一打出也会被 Actions 掩码
+                ok = send_tg(
+                    "🔑 *Freebuff authToken 已获取*\n\n"
+                    f"账号：`{email}`\n"
+                    f"id：`{user.get('id')}`\n"
+                    f"credits：`{user.get('credits')}`\n\n"
+                    "把下面这行填进 Cloudflare Worker 机密变量 `FREEBUFF_TOKEN`"
+                    "（多账号则换行追加）：\n"
+                    f"`{auth_token}`"
+                )
+                if not ok:
+                    print("❌ authToken 推送 TG 失败！token 未打印到日志，请检查 TG 配置后重试。")
+                    sys.exit(1)
+                print("🔑 authToken 已通过 Telegram 私密发送（未写入日志）。")
+            else:
+                mask_value(auth_token)
+                print("\n🔑 把下面这行填进 Cloudflare Worker 的机密变量 FREEBUFF_TOKEN：")
+                print("    " + auth_token)
             return user
         elif status == 401:
             print(f"   [{int(time.time()-start)}s] 尚未登录（401），继续等待…")
@@ -260,27 +312,6 @@ def cmd_session(args):
     return data
 
 
-def cmd_start_run(args):
-    """向 /api/v1/agent-runs 发起 START，拿 runId"""
-    tok = get_token()
-    if not tok:
-        print("❌ 未找到 authToken")
-        sys.exit(1)
-    headers = {"Authorization": f"Bearer {tok}"}
-    body = {
-        "action": "START",
-        "agentId": args.agent,
-        "ancestorRunIds": [],
-    }
-    print(f"📡 POST /api/v1/agent-runs (agent={args.agent})…")
-    status, data, _ = _http("POST", "/api/v1/agent-runs", body, headers)
-    print(f"→ HTTP {status}")
-    print(json.dumps(data, indent=2, ensure_ascii=False) if data else "(空响应)")
-    if isinstance(data, dict) and data.get("runId"):
-        print(f"\n✅ runId = {data['runId']}")
-    return data
-
-
 def cmd_chat(args):
     tok = get_token()
     if not tok:
@@ -327,8 +358,8 @@ def cmd_chat(args):
         "messages": [{"role": "user", "content": args.message or "Say hi in one short sentence."}],
         "stream": False,
         "codebuff_metadata": {
-            "run_id": run_id or f"run-{uuid.uuid4().hex[:12]}",
-            "client_id": f"cli-{uuid.uuid4().hex[:12]}",
+            "run_id": run_id or f"run-{secrets.token_hex(6)}",
+            "client_id": f"cli-{secrets.token_hex(6)}",
             "cost_mode": "free",
             **({"freebuff_instance_id": instance_id} if instance_id else {}),
         },
@@ -366,7 +397,8 @@ def main():
 
     p_login = sub.add_parser("login", help="开始登录（生成 URL + 轮询拿 token）")
     p_login.add_argument("--fingerprint", help="指定 fingerprintId（默认自动生成）")
-    p_login.add_argument("--open", action="store_true", help="自动打开系统浏览器")
+
+    sub.add_parser("tgsend", help="测试 TG 连通性（发一条测试消息）")
 
     sub.add_parser("show", help="显示已保存凭证并验证")
     p_sess = sub.add_parser("session", help="开/查 session")
@@ -380,9 +412,6 @@ def main():
     p_chat.add_argument("--run-id", default=None, help="指定 run_id（默认 START 一个）")
     p_chat.add_argument("--force", action="store_true", help="session/run 失败也直发 chat")
 
-    p_run = sub.add_parser("startrun", help="向 /api/v1/agent-runs 发 START 拿 runId")
-    p_run.add_argument("--agent", default="base2", help="agentId（默认 base2）")
-
     sub.add_parser("quota", help="查用量")
 
     args = p.parse_args()
@@ -391,8 +420,8 @@ def main():
         "show": cmd_show,
         "session": cmd_session,
         "chat": cmd_chat,
-        "startrun": cmd_start_run,
         "quota": cmd_quota,
+        "tgsend": cmd_tgsend,
     }[args.cmd](args)
 
 

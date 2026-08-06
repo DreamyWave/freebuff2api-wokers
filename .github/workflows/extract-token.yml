@@ -1,49 +1,73 @@
-name: Freebuff Token 提取
+name: 获取 Freebuff authToken
 
+# 只允许手动触发（Actions 页面 → Run workflow）
 on:
   workflow_dispatch:
     inputs:
-      fingerprint:
-        description: '指定 fingerprintId（留空自动生成）'
+      poll_timeout:
+        description: "授权等待秒数（默认 300，可在手机上慢慢操作）"
         required: false
-        default: ''
+        default: "300"
+        type: string
+      fingerprint:
+        description: "指定 fingerprintId（留空自动生成）"
+        required: false
+        default: ""
         type: string
 
+permissions:
+  actions: write
+  contents: write
+
 jobs:
-  extract:
-    name: 提取 Freebuff Token
+  oauth:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      # 强制：TG_BOT_TOKEN + TG_CHAT_ID 必须已配置，否则直接失败，不跑提取逻辑
-      - name: 检查 TG Secrets 已配置
+      # 强制校验 TG 变量：不配置则不运行
+      - name: 校验 TG 变量（未配置则不运行）
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
+          set -u
           if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
-            echo "::error::未配置 TG_BOT_TOKEN 或 TG_CHAT_ID。"
-            echo "请在仓库 Settings → Secrets and variables → Actions 里添加这两个 Secret 后再运行。"
-            echo "TG_BOT_TOKEN = 你的 Telegram bot token（找 @BotFather 创建）"
-            echo "TG_CHAT_ID  = 你的 Telegram 数字 chat id（给 @userinfobot 发消息获取）"
+            echo "❌ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，工作流不运行。"
+            echo "   请在仓库 Settings → Secrets and variables → Actions 配置这两个 secret："
+            echo "     - TG_BOT_TOKEN：Telegram Bot 的 token"
+            echo "     - TG_CHAT_ID  ：接收消息的 chat_id"
             exit 1
           fi
-          echo "✅ TG Secrets 已配置"
+          echo "✅ TG 变量已配置，继续。"
 
-      - name: 运行提取（URL/token 只发 TG，Actions 日志脱敏）
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 运行提取脚本（授权链接与 authToken 推送 TG）
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          FINGERPRINT: ${{ inputs.fingerprint }}
         run: |
           cd freebuff_tools
-          if [ -n "${{ inputs.fingerprint }}" ]; then
-            python3 extract_freebuff.py login --fingerprint "${{ inputs.fingerprint }}"
+          if [ -n "$FINGERPRINT" ]; then
+            python3 extract_freebuff.py login --fingerprint "$FINGERPRINT"
           else
             python3 extract_freebuff.py login
           fi
+
+      # 清理旧 run jobs：只保留最新 1 条运行记录
+      - name: clear old run jobs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "deleted: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
