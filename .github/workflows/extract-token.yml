@@ -1,0 +1,49 @@
+name: Freebuff Token 提取
+
+on:
+  workflow_dispatch:
+    inputs:
+      fingerprint:
+        description: '指定 fingerprintId（留空自动生成）'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  extract:
+    name: 提取 Freebuff Token
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 强制：TG_BOT_TOKEN + TG_CHAT_ID 必须已配置，否则直接失败，不跑提取逻辑
+      - name: 检查 TG Secrets 已配置
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "::error::未配置 TG_BOT_TOKEN 或 TG_CHAT_ID。"
+            echo "请在仓库 Settings → Secrets and variables → Actions 里添加这两个 Secret 后再运行。"
+            echo "TG_BOT_TOKEN = 你的 Telegram bot token（找 @BotFather 创建）"
+            echo "TG_CHAT_ID  = 你的 Telegram 数字 chat id（给 @userinfobot 发消息获取）"
+            exit 1
+          fi
+          echo "✅ TG Secrets 已配置"
+
+      - name: 运行提取（URL/token 只发 TG，Actions 日志脱敏）
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          cd freebuff_tools
+          if [ -n "${{ inputs.fingerprint }}" ]; then
+            python3 extract_freebuff.py login --fingerprint "${{ inputs.fingerprint }}"
+          else
+            python3 extract_freebuff.py login
+          fi

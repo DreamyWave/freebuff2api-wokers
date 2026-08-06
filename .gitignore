@@ -1,3 +1,8 @@
 node_modules/
 .dev.vars
 test/worker_tmp.mjs
+
+# 凭证/token 文件，绝不提交
+freebuff_tools/freebuff_credentials.json
+**/freebuff_credentials.json
+__pycache__/
