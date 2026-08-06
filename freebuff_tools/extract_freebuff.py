@@ -183,6 +183,9 @@ def cmd_tgsend(args):
 
 def cmd_login(args):
     # 交互方式：TG 配置了就推 TG；CI 环境强制要求 TG（workflow 第一步也会拦）
+    if in_ci() and not tg_configured():
+        print("::error::Actions 环境强制 TG 模式，请先配置 TG_BOT_TOKEN 和 TG_CHAT_ID")
+        sys.exit(1)
     use_tg = tg_configured()
 
     fingerprint_id = args.fingerprint or gen_fingerprint()
@@ -211,13 +214,6 @@ def cmd_login(args):
         except ValueError:
             pass
 
-    print("=" * 60)
-    print("1️⃣  在浏览器打开下面这个链接：")
-    print(f"    {login_url}")
-    print("2️⃣  用 Google 账号登录并授权")
-    print(f"3️⃣  脚本自动轮询等待，最多 {poll_timeout} 秒")
-    print("=" * 60)
-
     # 把授权链接推送到 TG，方便在手机上完成授权
     if use_tg:
         tg_msg = (
@@ -230,9 +226,15 @@ def cmd_login(args):
         if not ok:
             print("❌ 授权链接推送 TG 失败（请检查 TG_BOT_TOKEN / TG_CHAT_ID）")
             sys.exit(1)
-        print("📨 授权链接已推送到 Telegram。")
+        print("📨 授权链接已推送到 Telegram（URL 不打印到日志）。")
     else:
-        print("ℹ️ 未配置 TG，授权链接仅在下方日志中显示。")
+        # 非 TG（本地手动跑）才打印 URL
+        print("=" * 60)
+        print("1️⃣  在浏览器打开下面这个链接：")
+        print(f"    {login_url}")
+        print("2️⃣  用 Google 账号登录并授权")
+        print(f"3️⃣  脚本自动轮询等待，最多 {poll_timeout} 秒")
+        print("=" * 60)
 
     print(f"\n🔄 等待你授权（脚本自动轮询，最多 {poll_timeout} 秒）...")
     start = time.time()

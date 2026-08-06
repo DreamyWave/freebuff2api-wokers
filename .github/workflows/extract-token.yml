@@ -61,9 +61,9 @@ jobs:
         run: |
           cd freebuff_tools
           if [ -n "$FINGERPRINT" ]; then
-            python3 extract_freebuff.py login --fingerprint "$FINGERPRINT"
+            python3 -u extract_freebuff.py login --fingerprint "$FINGERPRINT"
           else
-            python3 extract_freebuff.py login
+            python3 -u extract_freebuff.py login
           fi
 
       # 清理旧 run jobs：只保留最新 1 条运行记录
