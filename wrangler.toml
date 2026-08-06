@@ -1,0 +1,6 @@
+name = "freebuff2api-workers"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# 地区：freebuff 免费模型对出口 IP 有 US 限制，Cloudflare Workers 默认 US 出口即可
+# 如需强制指定：workers_dev = true 即可（免费计划走美国出口）
