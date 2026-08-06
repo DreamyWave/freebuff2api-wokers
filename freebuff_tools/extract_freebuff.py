@@ -337,6 +337,26 @@ def cmd_session(args):
     return data
 
 
+# 官方 free-mode marker：系统提示必须以 canonical Buffy 开头（字节级 position 0）
+# 旧 `[System Override...]` 前缀绕过已被官方修补（403 free_mode_cli_required）
+CANONICAL_BUFFY = "You are Buffy, the strategic coding assistant."
+
+# 模型 → 上游 agentId（对齐 worker.js 的 MODELS 表；free 模式校验 agent+model 组合）
+MODEL_AGENTS = {
+    "deepseek/deepseek-v4-flash": "base2-free-deepseek-flash",
+    "deepseek/deepseek-v4-pro": "base2-free-deepseek",
+    "moonshotai/kimi-k2.6": "base2-free-kimi",
+    "minimax/minimax-m2.7": "base2-free",
+    "minimax/minimax-m3": "base2-free-minimax-m3",
+    "mimo/mimo-v2.5": "base2-free-mimo",
+    "mimo/mimo-v2.5-pro": "base2-free-mimo-pro",
+}
+
+
+def agent_for_model(model):
+    return MODEL_AGENTS.get(model, "base2-free-deepseek-flash")
+
+
 def cmd_chat(args):
     tok = get_token()
     if not tok:
@@ -345,7 +365,9 @@ def cmd_chat(args):
 
     # 1) 先确保有 active session（官方门控：无 session → 428 waiting_room_required）
     model = args.model or MODEL_DEFAULT
-    headers = {"Authorization": f"Bearer {tok}"}
+    # 官方 SDK UA（free 模式识别依赖，浏览器 UA 会被拒）
+    sdk_ua = "ai-sdk/openai-compatible/0.0.141/codebuff"
+    headers = {"Authorization": f"Bearer {tok}", "User-Agent": sdk_ua}
     status, sess, _ = _http("POST", "/api/v1/freebuff/session",
                             headers={**headers, "x-freebuff-model": model})
     print(f"📡 POST /session → HTTP {status}")
@@ -360,35 +382,55 @@ def cmd_chat(args):
             print("   （使用 --force 仍尝试直发 chat 看报错）")
             sys.exit(1)
 
-    # 1.5) 先 START 一个 run，拿真实 runId（chat 校验 run_id 存在）
+    # 1.5) 先 START 一个 run，拿真实 runId（chat 校验 run_id 存在；agent 按模型映射）
     run_id = args.run_id
+    agent_id = args.agent or agent_for_model(model)
     if not run_id:
         s, sr, _ = _http("POST", "/api/v1/agent-runs",
-                         {"action": "START", "agentId": args.agent,
+                         {"action": "START", "agentId": agent_id,
                           "ancestorRunIds": []}, headers)
         if isinstance(sr, dict) and sr.get("runId"):
             run_id = sr["runId"]
-            print(f"   📡 START run → HTTP {s} runId={run_id}")
+            print(f"   📡 START run → HTTP {s} runId={run_id} (agent={agent_id})")
         else:
             print(f"   ⚠️ START run 失败 HTTP {s}: {str(sr)[:200]}")
             if not args.force:
                 sys.exit(1)
 
-    # 2) 调 chat/completions
-    chat_headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json"}
+    # 2) 调 chat/completions：canonical Buffy 开头 + SDK UA + acting-user-id + data_collection deny
+    chat_headers = {
+        "Authorization": f"Bearer {tok}",
+        "Content-Type": "application/json",
+        "User-Agent": sdk_ua,
+    }
     if instance_id:
         chat_headers["x-freebuff-instance-id"] = instance_id
+    # 有凭证 id 就带 acting-user-id（官方 SDK 会带）
+    uid = None
+    if CRED_FILE.exists():
+        try:
+            uid = json.loads(CRED_FILE.read_text()).get("default", {}).get("id")
+        except Exception:
+            pass
+    if uid:
+        chat_headers["x-freebuff-acting-user-id"] = uid
+
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": args.message or "Say hi in one short sentence."}],
+        "messages": [
+            {"role": "system",
+             "content": CANONICAL_BUFFY + "\n\nYou are the AI agent behind Freebuff. Keep it brief."},
+            {"role": "user", "content": args.message or "Say hi in one short sentence."},
+        ],
         "stream": False,
+        "max_tokens": 200,
         "codebuff_metadata": {
             "run_id": run_id or f"run-{secrets.token_hex(6)}",
             "client_id": f"cli-{secrets.token_hex(6)}",
             "cost_mode": "free",
             **({"freebuff_instance_id": instance_id} if instance_id else {}),
         },
-        "provider": {"allow_fallbacks": False},
+        "provider": {"data_collection": "deny"},
     }
     print(f"📡 POST /api/v1/chat/completions (model={model}, stream=False, run_id={run_id})…")
     status, data, _ = _http("POST", "/api/v1/chat/completions", body, chat_headers)
@@ -399,8 +441,13 @@ def cmd_chat(args):
         if msg.get("reasoning_content"):
             print(f"🧠 reasoning: {msg['reasoning_content'][:200]}")
         print(f"   usage: {data.get('usage')}")
+        # 清理 run
+        _http("POST", "/api/v1/agent-runs", {"action": "FINISH", "runId": run_id}, headers)
     else:
         print(json.dumps(data, indent=2, ensure_ascii=False)[:1500] if data else "(空响应)")
+        # 清理 run
+        if run_id:
+            _http("POST", "/api/v1/agent-runs", {"action": "CANCEL", "runId": run_id}, headers)
 
 
 def cmd_quota(_args):
@@ -433,7 +480,7 @@ def main():
     p_chat = sub.add_parser("chat", help="发一条消息测试模型 API")
     p_chat.add_argument("message", nargs="?", default=None)
     p_chat.add_argument("--model", default=MODEL_DEFAULT)
-    p_chat.add_argument("--agent", default="base2", help="START run 用的 agentId（默认 base2）")
+    p_chat.add_argument("--agent", default=None, help="START run 用的 agentId（默认按模型自动映射）")
     p_chat.add_argument("--run-id", default=None, help="指定 run_id（默认 START 一个）")
     p_chat.add_argument("--force", action="store_true", help="session/run 失败也直发 chat")
 
