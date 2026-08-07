@@ -6,3 +6,4 @@ test/worker_tmp.mjs
 freebuff_tools/freebuff_credentials.json
 **/freebuff_credentials.json
 __pycache__/
+test/
