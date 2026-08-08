@@ -11,3 +11,6 @@ test/
 # 部署脚本含凭据读取逻辑，仅本地使用，不推送
 /credentials.yaml
 /deploy.sh
+
+# 更新记录本地自用，不推送 GitHub
+CHANGELOG.md

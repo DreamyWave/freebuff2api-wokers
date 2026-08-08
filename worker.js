@@ -26,8 +26,15 @@ export default {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
+    // healthz 不鉴权：健康检查/监控探针不应依赖 API key
+    if (request.method === "GET" && url.pathname === "/healthz") {
+      return jsonResponse({ status: "ok", version: "1.4.0", time: new Date().toISOString() }, 200);
+    }
+
     const key = getApiKey(request, env);
     if (!key) return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
+
+    cleanCache();
 
     if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
       return handleModels();
@@ -55,9 +62,24 @@ function parseAccounts(env) {
   return (env.FREEBUFF_TOKEN || "").split(/[\n,]/).map((s) => s.trim()).filter((s) => s.length > 8);
 }
 
-function pickToken(env) {
+function pickToken(env, sessionModel) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
+
+  // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
+  // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
+  // 浪费创建额度。只要当前模型的 session 缓存还活跃就钉在同一个号上，用满再换。
+  if (sessionModel) {
+    for (const t of pool) {
+      if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
+      const cached = sessCache.get(t + ":" + sessionModel);
+      if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now() + 60000) {
+        return t;
+      }
+    }
+  }
+
+  // 没有活跃缓存才轮询（跳过冷却中的号）
   for (let k = 0; k < pool.length; k++) {
     const t = pool[accountIdx % pool.length];
     accountIdx = (accountIdx + 1) % pool.length;
@@ -96,6 +118,7 @@ function enqueue(fn) {
 }
 
 const UPSTREAM_TIMEOUT_MS = 20000; // 上游单请求超时，避免客户端干等
+const NONSTREAM_TIMEOUT_MS = 45000; // 非流式要聚合完整上游流（含推理），给更充裕时间
 const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
@@ -302,7 +325,7 @@ async function handleChat(request, env) {
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const token = pickToken(env);
+    const token = pickToken(env, mc.session);
     try {
       // 1) session
       const sess = await createSession(token, mc.session);
@@ -327,7 +350,7 @@ async function handleChat(request, env) {
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
           method: "POST", headers, body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+          signal: AbortSignal.timeout(isStream ? UPSTREAM_TIMEOUT_MS : NONSTREAM_TIMEOUT_MS),
         });
         if (resp.ok) break;
         errText = await resp.text();
@@ -464,11 +487,33 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
 // 工具
 // ---------------------------------------------------------------------------
 
+// 轻量缓存清理：避免长时间运行后 Map 无限膨胀（Workers 无自动 GC）
+function cleanCache() {
+  const now = Date.now();
+  try {
+    if (sessCache.size > 50) {
+      for (const [k, v] of sessCache) {
+        const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : 0;
+        if (exp > 0 && exp < now) sessCache.delete(k);
+      }
+    }
+    if (runCache.size > 50) {
+      for (const [k, v] of runCache) {
+        if (now - v.ts > RUN_CACHE_TTL_MS) runCache.delete(k);
+      }
+    }
+  } catch {}
+}
+
+// /v1/models 保持静态列表。
+// ⚠️ 不要在这里查上游 GET /api/v1/freebuff/session（额度/状态）：
+// 该接口会占用账号 session，而 Freebuff 一个号同一时间只能一个客户端在线，
+// 查询会干扰/顶掉正在进行的 chat 会话（428 waiting_room_required）。
 function handleModels() {
   return jsonResponse({
     object: "list",
-    data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now()/1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.2.1" });
+    data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
+  }, 200, { "X-Freebuff2api-Version": "1.4.0" });
 }
 
 function getApiKey(request, env) {
