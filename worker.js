@@ -28,7 +28,8 @@ export default {
 
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
-      return jsonResponse({ status: "ok", version: "1.5.0", time: new Date().toISOString() }, 200);
+      const acctCount = parseAccounts(env).length;
+      return jsonResponse({ status: "ok", version: "1.5.0.2", accounts: acctCount, time: new Date().toISOString() }, 200);
     }
 
     const key = getApiKey(request, env);
@@ -41,6 +42,9 @@ export default {
     }
     if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       return handleChat(request, env);
+    }
+    if (request.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
+      return handleResponses(request, env);
     }
     if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
       return jsonResponse({ error: { message: "Anthropic endpoint not yet implemented", type: "not_implemented" } }, 501);
@@ -324,9 +328,95 @@ function buildUpstreamPayload(params, mc, sess, runId) {
 async function handleChat(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
-
   const isStream = !!params.stream;
   const mc = MODELS.find((m) => m.id === (params.model || DEFAULT_MODEL)) || MODELS[0];
+  return executeChat(env, params, mc, isStream, "chat");
+}
+
+// OpenAI Responses API（/v1/responses）入口：把 Responses 请求翻译成 chat completions 上游调用
+async function handleResponses(request, env) {
+  let params;
+  try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  const isStream = !!params.stream;
+  const mc = MODELS.find((m) => m.id === (params.model || DEFAULT_MODEL)) || MODELS[0];
+  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
+}
+
+// Responses API 请求 → chat completions 参数（字段名/结构翻译）
+function responsesToChatParams(params, mc) {
+  const chat = {};
+  for (const k of ["temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls", "stop", "seed", "store", "metadata", "user", "stream"]) {
+    if (params[k] !== undefined && params[k] !== null) chat[k] = params[k];
+  }
+  if (params.max_output_tokens !== undefined && params.max_output_tokens !== null) chat.max_completion_tokens = params.max_output_tokens;
+  if (params.reasoning && typeof params.reasoning === "object" && params.reasoning.effort) chat.reasoning_effort = params.reasoning.effort;
+  if (params.text && typeof params.text === "object" && params.text.format && params.text.format.type && params.text.format.type !== "text") {
+    chat.response_format = { type: params.text.format.type };
+    if (params.text.format.json_schema) chat.response_format.json_schema = params.text.format.json_schema;
+  }
+  // Responses 工具格式（扁平 function）→ chat completions 格式（function 包装）。
+  // 上游只接受 type:"function"，namespace/web_search 等非 function 工具一律过滤，避免反序列化报错。
+  if (Array.isArray(params.tools)) {
+    chat.tools = params.tools
+      .filter((t) => t && typeof t === "object" && t.type === "function")
+      .map((t) => ({
+        type: "function",
+        function: {
+          name: t.name || "",
+          description: t.description || "",
+          parameters: t.parameters || { type: "object", properties: {} },
+        },
+      }));
+    if (chat.tools.length === 0) delete chat.tools;
+  }
+  // Responses tool_choice → chat 格式；仅支持 function 类型，其它对象形式退回 auto
+  if (params.tool_choice && typeof params.tool_choice === "object") {
+    if (params.tool_choice.type === "function" && params.tool_choice.name) {
+      chat.tool_choice = { type: "function", function: { name: params.tool_choice.name } };
+    } else {
+      chat.tool_choice = "auto";
+    }
+  }
+  chat.model = mc.id;
+  chat.messages = responsesInputToMessages(params.input, params.instructions);
+  return chat;
+}
+
+// Responses API input → chat messages（input 可为字符串或消息条目数组）
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (instructions) messages.push({ role: "system", content: instructions });
+  if (typeof input === "string") { messages.push({ role: "user", content: input }); return messages; }
+  if (!Array.isArray(input)) { messages.push({ role: "user", content: input == null ? "" : String(input) }); return messages; }
+  for (const item of input) {
+    if (typeof item === "string") { messages.push({ role: "user", content: item }); continue; }
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "function_call_output") {
+      messages.push({ role: "tool", tool_call_id: item.call_id || "", content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "") });
+      continue;
+    }
+    // function_call / reasoning / item_reference 等条目本地无法执行/回溯，跳过
+    if (item.type === "function_call" || item.type === "reasoning" || item.type === "item_reference") continue;
+    const role = item.role || "user";
+    const content = item.content;
+    if (typeof content === "string") { messages.push({ role, content }); continue; }
+    if (Array.isArray(content)) {
+      const parts = [];
+      for (const c of content) {
+        if (!c || typeof c !== "object") continue;
+        if (c.type === "input_text" || c.type === "output_text") { parts.push({ type: "text", text: c.text ?? "" }); continue; }
+        if (c.type === "text" && typeof c.text === "string") { parts.push(c); continue; }
+      }
+      messages.push({ role, content: parts.length ? parts : "" });
+      continue;
+    }
+    messages.push({ role, content: "" });
+  }
+  return messages;
+}
+
+// chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
+async function executeChat(env, chatParams, mc, isStream, mode) {
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
@@ -349,7 +439,7 @@ async function handleChat(request, env) {
       //    清缓存强制重建后重试一次；仍失败则冷却该号交给外层换号）
       let resp, errText = "", sessForChat = sess;
       for (let attempt = 0; attempt < 2; attempt++) {
-        const payload = buildUpstreamPayload(params, mc, sessForChat, run.runId);
+        const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
         const headers = {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
@@ -389,14 +479,17 @@ async function handleChat(request, env) {
 
       if (isStream) {
         const { readable, writable } = new TransformStream();
-        pipeUpstreamToClient(resp.body, writable);
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
+        else pipeUpstreamToClient(resp.body, writable);
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
+
+      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
       return jsonResponse(agg, 200);
     } catch (e) {
-      console.error("[handleChat]", e);
+      console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
       // 任何上游交互失败/超时（含 chat fetch 20s abort）都冷却当前号，继续换下一个号
       if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
@@ -408,6 +501,7 @@ async function handleChat(request, env) {
   }
   return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
 }
+
 
 // ---------------------------------------------------------------------------
 // SSE 处理
@@ -494,6 +588,250 @@ async function streamToNonStream(upstreamBody, upstreamModel) {
 }
 
 // ---------------------------------------------------------------------------
+// Responses API（/v1/responses）输出
+// ---------------------------------------------------------------------------
+
+function responsesBase(mc, respId, createdAt) {
+  return {
+    id: respId || "resp_" + Math.random().toString(36).slice(2, 10),
+    object: "response",
+    created_at: createdAt ?? Math.floor(Date.now() / 1000),
+    status: "in_progress",
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    max_output_tokens: null,
+    model: mc.id,
+    output: [],
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: true,
+    temperature: 1.0,
+    text: { format: { type: "text" } },
+    tool_choice: "auto",
+    tools: [],
+    top_p: 1.0,
+    truncation: "disabled",
+    usage: null,
+    user: null,
+    metadata: {},
+  };
+}
+
+function responsesUsage() {
+  return { input_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 };
+}
+
+// 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc) {
+  const reader = upstreamBody.getReader();
+  const writer = writable.getWriter();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const respId = "resp_" + Math.random().toString(36).slice(2, 10);
+  const createdAt = Math.floor(Date.now() / 1000);
+  let buf = "", model = "", usage = null;
+  const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
+
+  // 按上游出现顺序记录输出项：message（文本）或 function_call（工具调用）
+  const items = [];
+  let nextOutputIndex = 0;
+  let contentItem = null;
+  const toolItems = new Map(); // 上游 tool_calls index → 输出项
+
+  const startContent = () => {
+    const item = {
+      kind: "message",
+      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      outputIndex: nextOutputIndex++,
+      text: "",
+      contentIndex: 0,
+      started: false,
+    };
+    items.push(item);
+    return item;
+  };
+  const startTool = (tc) => {
+    const fn = tc.function || {};
+    const item = {
+      kind: "function_call",
+      id: "fc_" + Math.random().toString(36).slice(2, 10),
+      outputIndex: nextOutputIndex++,
+      callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
+      name: fn.name || "",
+      args: "",
+    };
+    items.push(item);
+    return item;
+  };
+
+  (async () => {
+    try {
+      await send({ type: "response.created", response: responsesBase(mc, respId, createdAt) });
+      await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt) });
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "" || payload === "[DONE]") continue;
+          try {
+            const obj = unwrapData(JSON.parse(payload));
+            const choice = obj?.choices?.[0];
+            if (!choice) continue;
+            const delta = choice.delta || {};
+                if (obj.model) model = obj.model;
+                if (obj.usage) usage = obj.usage;
+
+            // 工具调用增量（chat 格式 delta.tool_calls[]）
+            if (Array.isArray(delta.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                if (!tc || typeof tc !== "object") continue;
+                const ti = tc.index ?? 0;
+                let item = toolItems.get(ti);
+                if (!item) {
+                  item = startTool(tc);
+                  toolItems.set(ti, item);
+                  await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
+                }
+                const fn = tc.function || {};
+                if (fn.name && !item.name) item.name = fn.name;
+                if (fn.arguments) {
+                  item.args += fn.arguments;
+                  await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: fn.arguments });
+                }
+              }
+            }
+
+            // 文本增量
+            if (delta.content) {
+              if (!contentItem) contentItem = startContent();
+              if (!contentItem.started) {
+                contentItem.started = true;
+                await send({ type: "response.output_item.added", output_index: contentItem.outputIndex, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+                await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+              }
+              contentItem.text += delta.content;
+              await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, delta: delta.content });
+            }
+          } catch {}
+        }
+      }
+
+      // 既无文本也无工具调用时补一个空 message，避免 output 为空数组
+      if (items.length === 0) {
+        const item = startContent();
+        item.started = true;
+        await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+        await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+      }
+
+      // 收尾：按出现顺序输出每个输出项的 done 事件
+      for (const item of items) {
+        if (item.kind === "message") {
+          if (!item.started) {
+            await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+            await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+          }
+          const part = { type: "output_text", text: item.text, annotations: [] };
+          await send({ type: "response.output_text.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, text: item.text });
+          await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part });
+          await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [part] } });
+        } else {
+          await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
+        }
+      }
+
+      const resp = responsesBase(mc, respId, createdAt);
+      resp.status = "completed";
+      resp.model = model || mc.id;
+      resp.output = items.map((item) =>
+        item.kind === "message"
+          ? { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] }
+          : { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args }
+      );
+      resp.usage = usage || responsesUsage();
+      await send({ type: "response.completed", response: resp });
+    } catch {}
+    finally { try { await writer.close(); } catch {} }
+  })();
+}
+
+// 非流式：聚合上游流成 Responses API 非流式对象
+async function responsesToNonStream(upstreamBody, mc) {
+  const reader = upstreamBody.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", model = "", outputText = "", reasoning = "", usage = null;
+  const toolItems = new Map(); // 上游 tool_calls index → {id, callId, name, args}
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "" || payload === "[DONE]") continue;
+      try {
+        const obj = unwrapData(JSON.parse(payload));
+        const choice = obj?.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (delta.content) outputText += delta.content;
+        if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!tc || typeof tc !== "object") continue;
+            const ti = tc.index ?? 0;
+            let item = toolItems.get(ti);
+            if (!item) {
+              const fn = tc.function || {};
+              item = {
+                id: "fc_" + Math.random().toString(36).slice(2, 10),
+                callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
+                name: fn.name || "",
+                args: "",
+              };
+              toolItems.set(ti, item);
+            }
+            const fn = tc.function || {};
+            if (fn.name && !item.name) item.name = fn.name;
+            if (fn.arguments) item.args += fn.arguments;
+          }
+        }
+        if (obj.model) model = obj.model;
+        if (obj.usage) usage = obj.usage;
+      } catch {}
+    }
+  }
+  const resp = responsesBase(mc, undefined, Math.floor(Date.now() / 1000));
+  resp.status = "completed";
+  resp.model = model || mc.id;
+  resp.output = [];
+  if (outputText || reasoning) {
+    const text = outputText || reasoning;
+    resp.output.push({
+      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      type: "message", status: "completed", role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    });
+  }
+  for (const item of toolItems.values()) {
+    resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
+  }
+  resp.usage = usage || responsesUsage();
+  return resp;
+}
+
+
+// ---------------------------------------------------------------------------
 // 工具
 // ---------------------------------------------------------------------------
 
@@ -523,7 +861,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.5.0" });
+  }, 200, { "X-Freebuff2api-Version": "1.5.0.2" });
 }
 
 function getApiKey(request, env) {
