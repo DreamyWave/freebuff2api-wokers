@@ -28,7 +28,7 @@ export default {
 
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
-      return jsonResponse({ status: "ok", version: "1.4.0", time: new Date().toISOString() }, 200);
+      return jsonResponse({ status: "ok", version: "1.5.0", time: new Date().toISOString() }, 200);
     }
 
     const key = getApiKey(request, env);
@@ -176,6 +176,16 @@ async function createSession(token, sessionModel, forceCreate = false) {
       sessCache.clear();
     }
   }
+
+  // ad) 刷广告：还原官方 CLI 行为，在创建 session 前上报广告曝光。
+  //      失败静默、超时 5s，完全不影响聊天。
+  try {
+    await enqueueUp("POST", "/api/v1/ads", token,
+      { provider: "gravity", sessionId: crypto.randomUUID(), surface: "waiting_room",
+        device: { os: "windows", timezone: "Asia/Shanghai", locale: "zh-CN" },
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" },
+      { "Content-Type": "application/json" }, 5000);
+  } catch {}
 
   // 2) create（可能 queue）。⚠️ 实测(2026-08-07)：x-freebuff-multi-session:1 创建的实例上游 GET 为
   //    status:none、chat 报 428 waiting_room_required；必须不带该 header 用默认主 session 才有效
@@ -513,7 +523,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.4.0" });
+  }, 200, { "X-Freebuff2api-Version": "1.5.0" });
 }
 
 function getApiKey(request, env) {
