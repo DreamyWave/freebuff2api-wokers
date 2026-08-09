@@ -10,26 +10,27 @@
 
 ## ✨ 特性
 
-- 🔥 **两个模型实测不限量**（见下），其余每日 6 次额度
+- ⭐ **完整访问模式模型**：Cloudflare Workers 默认使用美国出口，通常可获得 Freebuff 完整访问模式；其中 DeepSeek V4 Flash 和 MiMo 2.5 属于官方特殊的非 Premium 模型
+- 🔒 **常规模型基础额度**：除上述两个特殊模型外，普通模型按每日 6 次 session 的基础额度理解；不会宣传为无限量
 - 🔁 **多账号自动切换**：撞额度自动冷却并切换，逗号分隔即可
 - 💡 **优先复用活跃 session**：一个 session 约 1 小时有效，创建 session 才扣额度；只要当前模型的 session 还活跃就钉在同一账号上，用满再换，最大化额度利用率
 - 📢 **广告与 streak 流程兼容**：创建新 session 前，Worker 会按官方客户端流程请求广告，并调用 `GET /api/v1/freebuff/streak` 尝试签到；相关请求失败会静默跳过，不阻塞聊天
-- 🧩 **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`（流式/非流式都支持）
+- 🧩 **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`（流式/非流式视接口支持情况而定）
 - ❤️ **健康检查**：`GET /healthz`（免鉴权），方便监控探活
 - 📦 **单文件部署**：无依赖，CF 控制台粘贴即用
 
-## ⭐ 无限量模型（重点）
+## ⭐ 特殊模型：DeepSeek V4 Flash 与 MiMo 2.5
 
-以下模型**实测不在上游限额表内**（`rateLimitsByModel` 无对应条目），当前可无限使用：
+Worker 通过 Cloudflare Workers 访问 Freebuff，上游通常会将请求识别为美国/完整访问模式。官方 Desktop 在完整模式下将下面两个模型归入 **unlimited 非 Premium 类别**；这里的 `unlimited` 主要表示模型分类和并发类别，**不是对所有账号、地区、接口和时间都作绝对无限量保证**：
 
-| 模型 | 状态 |
+| 模型 | 完整模式下的说明 |
 |---|---|
-| `deepseek/deepseek-v4-flash` | ✅ **不限量**（DeepSeek V4 Flash，主力推荐） |
-| `mimo/mimo-v2.5` | ✅ **不限量**（MiniMax MiMo 2.5） |
+| `deepseek/deepseek-v4-flash` | 官方非 Premium 模型；主力推荐，当前 Worker 探测未显示基础日限额 |
+| `mimo/mimo-v2.5` | 官方非 Premium 模型；当前 Worker 探测未显示基础日限额 |
 
-> ⚠️ 这是逆向发现的**当前状态**，官方随时可能把这两个加进限额表。趁能用赶紧用。
+> ⚠️ 受限模式官方明确为 DeepSeek V4 Flash 和 MiMo 2.5 每天 6 个一小时 session；Worker 默认走美国出口，通常不属于该受限模式。最终是否可用及实际额度仍以 Freebuff 上游返回为准，官方规则也可能调整。
 
-其余模型每天 **6 次/太平洋日**（24h 窗口，北京时间约 15:00 重置），见下方[完整模型列表](#-模型列表)。
+除这两个特殊模型外，普通模型统一按 **每日 6 次基础 session / 太平洋日** 理解（北京时间约 15:00 重置）。`referral`、`streak`、独立共享池和上游临时限制属于额外条件，不能据此宣传为无限量。
 
 > 💡 **关于额度**：扣额度按「创建 session」计（不是每次对话）。一次 session 约 1 小时有效，期间多轮对话不重复扣。所以 4 个账号 × 每天 6 次 ≈ 全天覆盖。
 >
@@ -171,16 +172,22 @@ curl -N https://你的worker.workers.dev/v1/chat/completions \
 ## 📋 模型列表
 
 > 映射来源：Freebuff Desktop 0.0.51（`orchestrator.js` 官方 `FREEBUFF_ROOT_AGENT_ID_BY_MODEL`，2026-08-07 实测同步）。
-> 额度按**太平洋日**（24h 窗口，北京时间约 15:00 重置）独立计算，按「创建 session」扣减，一个 session 约 1 小时有效。
+> Worker 通过 Cloudflare Workers 访问上游，默认使用美国出口，按 Freebuff 完整访问模式说明。除 Flash 和 MiMo 这两个官方特殊的非 Premium 模型外，其余模型按**每日 6 次基础 session / 太平洋日**理解（北京时间约 15:00 重置）；额度按「创建 session」扣减，一个 session 约 1 小时有效。
 
-### ⭐ 无限量（不在限额表）
+### ⭐ 完整模式特殊模型：非 Premium
 
-| API 模型名 | session 模型 | 上游 agentId |
-|---|---|---|
-| `deepseek/deepseek-v4-flash` | 同左 | `base2-free-deepseek-flash` |
-| `mimo/mimo-v2.5` | 同左 | `base2-free-mimo` |
+官方 Desktop 在完整访问模式下将下面两个模型归入 `unlimited` 非 Premium 类别。这里的 `unlimited` 主要表示官方模型分类和 Desktop 并发类别，**不是任何账号、接口或时间段的绝对无限量承诺**。Worker 当前探测也未在 `rateLimitsByModel` 中看到它们的基础日限额。
 
-### 🔒 每日 6 次限额
+| API 模型名 | session 模型 | 上游 agentId | 说明 |
+|---|---|---|---|
+| `deepseek/deepseek-v4-flash` | 同左 | `base2-free-deepseek-flash` | 完整模式特殊模型；主力推荐 |
+| `mimo/mimo-v2.5` | 同左 | `base2-free-mimo` | 完整模式特殊模型；均衡性能 |
+
+> ⚠️ 受限模式官方明确将这两个模型限制为每天 6 个一小时 session。Worker 默认走美国出口，通常不属于该受限模式；最终可用性和实际额度仍以 Freebuff 上游返回为准。
+
+### 🔒 普通模型：每日 6 次基础额度
+
+以下模型没有“无限量”说明，统一按每日 6 次基础 session 处理；实际额度可能因账号、官方 `referral` / `streak`、通道状态或上游规则变化而不同。
 
 | API 模型名 | session 模型 | 上游 agentId |
 |---|---|---|
@@ -194,14 +201,16 @@ curl -N https://你的worker.workers.dev/v1/chat/completions \
 | `crof/greg-2-super` | 同左 | `base2-free-greg-2-super` |
 | `meta/muse-spark-1.2-contributor` | 同左 | `base2-free-muse-spark` |
 
-### 🎁 特殊开放
+### 🎁 独立资格或容量限制
+
+以下模型不属于普通模型的直接开放池，是否能创建 session 由官方资格、共享容量或上游状态决定；即使获得资格，也不代表无限量使用：
 
 | API 模型名 | session 模型 | 上游 agentId | 限制 |
 |---|---|---|---|
-| `z-ai/glm-5.2` | 同左 | `base2-free-glm` | 需 referral 邀请 |
-| `anthropic/claude-fable-5` | 同左 | `base2-free-fable` | 仅 9am-5pm ET 开放 |
+| `z-ai/glm-5.2` | 同左 | `base2-free-glm` | 需 referral / streak 等官方资格，使用独立额度池 |
+| `anthropic/claude-fable-5` | 同左 | `base2-free-fable` | 官方容量限制试用，可能按时段开放 |
 
-> 📝 实测补充（2026-08-08）：`ling-3.0-flash:free` 上游可能返回 404 提示改用付费 slug；`claude-fable-5` 免费账号建 session 可能被上游拒绝（session_model_mismatch）。
+> 📝 实测补充（2026-08-08）：`ling-3.0-flash:free` 上游可能返回 404 并提示改用付费 slug；`claude-fable-5` 免费账号建 session 可能被上游拒绝（`session_model_mismatch`）。这些现象属于上游可用性问题，不代表 Worker 映射失效。
 
 ## 👥 多账号
 
