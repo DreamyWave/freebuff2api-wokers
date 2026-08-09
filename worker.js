@@ -35,7 +35,7 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.4",
+        version: "1.6.5",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -106,6 +106,7 @@ const PROBE_TTL_MS = 10 * 60 * 1000; // 探测结果缓存 10 分钟，避免每
  * 
  * 额外：GET /api/v1/freebuff/session 拿 rateLimitsByModel → quota（recentCount/limit），
  * 供 pickToken 按剩余额度选号（v1.6.2）。GET 不建 session，0 消耗。
+ * 服务端可能默认返回 compact 响应；显式请求完整额度快照，避免 quota 探测退化。
  */
 async function probeAccount(token) {
   const cached = acctHealth.get(token);
@@ -116,7 +117,14 @@ async function probeAccount(token) {
       const info = { alive: true, uid: r.data.id, checkedAt: Date.now(), quota: null };
       // 顺便查额度（0 消耗，GET 不建 session）
       try {
-        const s = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, undefined, SESSION_TIMEOUT_MS);
+        const s = await enqueueUp(
+          "GET",
+          "/api/v1/freebuff/session",
+          token,
+          undefined,
+          { "x-freebuff-include-unused-rate-limits": "1" },
+          SESSION_TIMEOUT_MS,
+        );
         if (s.status === 200 && s.data && s.data.rateLimitsByModel) {
           info.quota = s.data.rateLimitsByModel; // { model: { recentCount, limit, ... } }
         }
@@ -1024,7 +1032,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.4" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.5" });
 }
 
 function getApiKey(request, env) {
