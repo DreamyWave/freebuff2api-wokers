@@ -35,14 +35,14 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.0",
+        version: "1.6.1",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
         account_details: probes.map((p) => ({
           token: p.token.slice(0, 8) + "...",
           alive: p.alive,
-          uid: p.uid,
+          uid: p.uid ? p.uid.slice(0, 8) + "..." : null, // 脱敏：uid 也是敏感账号 id，不完整暴露
         })),
         time: new Date().toISOString(),
       }, 200);
@@ -958,7 +958,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.0" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.1" });
 }
 
 function getApiKey(request, env) {
