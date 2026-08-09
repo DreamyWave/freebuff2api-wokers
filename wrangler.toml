@@ -1,9 +1,0 @@
-name = "freebuff2api"
-main = "worker.js"
-compatibility_date = "2024-11-01"
-
-# 地区：freebuff 免费模型对出口 IP 有 US 限制，Cloudflare Workers 默认 US 出口即可
-# 如需强制指定：workers_dev = true 即可（免费计划走美国出口）
-#
-# 敏感变量（FREEBUFF_TOKEN / FREEBUFF_API_KEY / FREEBUFF_USER_ID）用
-# `wrangler secret put` 设置，不写入本文件（避免泄露进 git）。
