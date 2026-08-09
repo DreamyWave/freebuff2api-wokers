@@ -29,7 +29,7 @@ export default {
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
       const acctCount = parseAccounts(env).length;
-      return jsonResponse({ status: "ok", version: "1.5.0.4", accounts: acctCount, time: new Date().toISOString() }, 200);
+      return jsonResponse({ status: "ok", version: "1.5.0.5", accounts: acctCount, time: new Date().toISOString() }, 200);
     }
 
     const key = getApiKey(request, env);
@@ -62,8 +62,17 @@ const cooldowns = new Map();      // token -> 冷却到期 ms
 const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt }（必须带 token，多账号防串号）
 
 function parseAccounts(env) {
-  // 支持一行一个（换行）或逗号分隔
-  return (env.FREEBUFF_TOKEN || "").split(/[\n,]/).map((s) => s.trim()).filter((s) => s.length > 8);
+  // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
+  // 例："t1\nt2:u2\nt3,u4:u4" → [{token:t1,uid:null},{token:t2,uid:u2},...]
+  return (env.FREEBUFF_TOKEN || "").split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 8)
+    .map((s) => {
+      const idx = s.indexOf(":");
+      if (idx > 0) return { token: s.slice(0, idx).trim(), uid: s.slice(idx + 1).trim() || null };
+      return { token: s, uid: null };
+    })
+    .filter((a) => a.token.length > 8);
 }
 
 function pickToken(env, sessionModel) {
@@ -74,20 +83,22 @@ function pickToken(env, sessionModel) {
   // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
   // 浪费创建额度。只要当前模型的 session 缓存还活跃就钉在同一个号上，用满再换。
   if (sessionModel) {
-    for (const t of pool) {
+    for (const acct of pool) {
+      const t = acct.token;
       if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
       const cached = sessCache.get(t + ":" + sessionModel);
       if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now() + 60000) {
-        return t;
+        return acct;
       }
     }
   }
 
   // 没有活跃缓存才轮询（跳过冷却中的号）
   for (let k = 0; k < pool.length; k++) {
-    const t = pool[accountIdx % pool.length];
+    const acct = pool[accountIdx % pool.length];
     accountIdx = (accountIdx + 1) % pool.length;
-    if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return t;
+    const t = acct.token;
+    if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
   }
   const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
   if (oldest) cooldowns.delete(oldest[0]);
@@ -431,7 +442,9 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
   // 免费通道上游波动大（并发>1 即出问题、排队超时），单请求内换号比等客户端重试成功率高得多。
   let lastErrMsg = "";
   for (let acctTry = 0; acctTry < pool.length; acctTry++) {
-    const token = pickToken(env, mc.session);
+    const acct = pickToken(env, mc.session);
+    const token = acct ? acct.token : null;
+    if (!token) break;
     try {
       // 1) session
       const sess = await createSession(token, mc.session);
@@ -452,13 +465,14 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           "x-freebuff-instance-id": sessForChat.instanceId,
           "User-Agent": "ai-sdk/openai-compatible/0.0.141/codebuff",
         };
-        // ⚠️ 默认不带 x-freebuff-acting-user-id：上游按该头（user_id）独立计额（limit 6/天），
-        // 固定带同一个 FREEBUFF_USER_ID 会让 4 个 token 号共享同一个额度池，一个号用完全 429。
-        // 去掉后上游按 Authorization token 独立计额，多号轮换才能真正生效。
-        // 如需按 user 隔离（如不同 token 配不同 user_id），可显式设置 FREEBUFF_USER_ID。
-        if (env.FREEBUFF_USER_ID && env.FREEBUFF_USER_ID !== "2027142c-e843-443f-b7d0-d636016d37c4") {
-          headers["x-freebuff-acting-user-id"] = env.FREEBUFF_USER_ID;
-        }
+        // x-freebuff-acting-user-id：优先用 token 配对的 uid（"token:uid" 格式），
+        // 上游按该头独立计额（limit 6/天）——每个号配自己的 uid 才能真正多号轮换。
+        // 无配对 uid 时回退 FREEBUFF_USER_ID（跳过默认值 2027142c-...，该值会导致 4 号共享额度池）；
+        // 都没有就不带，让上游按 Authorization token 计额。
+        const acctUid = acct && acct.uid;
+        const globalUid = env.FREEBUFF_USER_ID && env.FREEBUFF_USER_ID !== "2027142c-e843-443f-b7d0-d636016d37c4" ? env.FREEBUFF_USER_ID : null;
+        const actingUid = acctUid || globalUid;
+        if (actingUid) headers["x-freebuff-acting-user-id"] = actingUid;
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
           method: "POST", headers, body: JSON.stringify(payload),
@@ -876,7 +890,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.5.0.4" });
+  }, 200, { "X-Freebuff2api-Version": "1.5.0.5" });
 }
 
 function getApiKey(request, env) {
