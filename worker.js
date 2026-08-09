@@ -29,7 +29,23 @@ export default {
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
       const acctCount = parseAccounts(env).length;
-      return jsonResponse({ status: "ok", version: "1.5.0.5", accounts: acctCount, time: new Date().toISOString() }, 200);
+      // v1.6.0：探测全部账号（GET /api/v1/me，0 消耗），返回存活数
+      const probes = await probeAllAccounts(env);
+      const aliveCount = probes.filter((p) => p.alive === true).length;
+      const unknownCount = probes.filter((p) => p.alive === null).length;
+      return jsonResponse({
+        status: "ok",
+        version: "1.6.0",
+        accounts: acctCount,
+        alive_accounts: aliveCount,
+        unknown_accounts: unknownCount,
+        account_details: probes.map((p) => ({
+          token: p.token.slice(0, 8) + "...",
+          alive: p.alive,
+          uid: p.uid,
+        })),
+        time: new Date().toISOString(),
+      }, 200);
     }
 
     const key = getApiKey(request, env);
@@ -75,15 +91,67 @@ function parseAccounts(env) {
     .filter((a) => a.token.length > 8);
 }
 
+// ---------------------------------------------------------------------------
+// 账号健康探测（v1.6.0）：GET /api/v1/me 不消耗 session/额度，探测 token 有效性并自动发现 uid
+// ---------------------------------------------------------------------------
+
+const acctHealth = new Map(); // token -> { alive, uid, checkedAt }
+const PROBE_TTL_MS = 10 * 60 * 1000; // 探测结果缓存 10 分钟，避免每次请求都打上游
+
+/**
+ * 探测单个账号：GET /api/v1/me（0 消耗，不建 session）
+ * - 200 → { alive: true, uid: data.id }（uid = 真实账号 id，自动发现）
+ * - 401 → { alive: false }（token 失效）
+ * - 其他/网络错误 → 不判定失效（返回 null 由调用方决定是否信任缓存）
+ */
+async function probeAccount(token) {
+  const cached = acctHealth.get(token);
+  if (cached && Date.now() - cached.checkedAt < PROBE_TTL_MS) return cached;
+  try {
+    const r = await enqueueUp("GET", "/api/v1/me", token, undefined, undefined, SESSION_TIMEOUT_MS);
+    if (r.status === 200 && r.data && typeof r.data.id === "string") {
+      const info = { alive: true, uid: r.data.id, checkedAt: Date.now() };
+      acctHealth.set(token, info);
+      return info;
+    }
+    if (r.status === 401 || r.status === 403) {
+      const info = { alive: false, uid: null, checkedAt: Date.now() };
+      acctHealth.set(token, info);
+      return info;
+    }
+    return null; // 网络错误/其他状态：不判定
+  } catch {
+    return null;
+  }
+}
+
+/** 探测全部账号并返回汇总（healthz 用） */
+async function probeAllAccounts(env) {
+  const pool = parseAccounts(env);
+  const results = [];
+  for (const acct of pool) {
+    const info = await probeAccount(acct.token);
+    results.push({ token: acct.token, alive: info ? info.alive : null, uid: info ? info.uid : null });
+  }
+  return results;
+}
+
 function pickToken(env, sessionModel) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
+
+  // v1.6.0：跳过已探测为失效的号（alive=false）；未探测/探测失败的不跳过（避免误杀）
+  const alivePool = pool.filter((acct) => {
+    const h = acctHealth.get(acct.token);
+    return !(h && h.alive === false);
+  });
+  const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
 
   // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
   // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
   // 浪费创建额度。只要当前模型的 session 缓存还活跃就钉在同一个号上，用满再换。
   if (sessionModel) {
-    for (const acct of pool) {
+    for (const acct of usePool) {
       const t = acct.token;
       if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
       const cached = sessCache.get(t + ":" + sessionModel);
@@ -94,9 +162,9 @@ function pickToken(env, sessionModel) {
   }
 
   // 没有活跃缓存才轮询（跳过冷却中的号）
-  for (let k = 0; k < pool.length; k++) {
-    const acct = pool[accountIdx % pool.length];
-    accountIdx = (accountIdx + 1) % pool.length;
+  for (let k = 0; k < usePool.length; k++) {
+    const acct = usePool[accountIdx % usePool.length];
+    accountIdx = (accountIdx + 1) % usePool.length;
     const t = acct.token;
     if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
   }
@@ -890,7 +958,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.5.0.5" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.0" });
 }
 
 function getApiKey(request, env) {
