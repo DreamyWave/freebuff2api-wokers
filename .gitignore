@@ -17,3 +17,6 @@ CHANGELOG.md
 
 # wrangler 本地缓存/状态，不提交
 .wrangler/
+
+# ⚠️ wrangler.toml 含敏感变量（FREEBUFF_TOKEN 等），绝不提交 GitHub
+wrangler.toml
