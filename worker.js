@@ -35,7 +35,7 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.5",
+        version: "1.6.6",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -794,6 +794,32 @@ function responsesUsage() {
   return { input_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 };
 }
 
+// 上游是 Chat Completions 格式，Responses API 要求 input/output_tokens。
+// 统一归一化，避免把不完整或错误格式的 usage 直接透传给严格客户端。
+function chatUsageToResponsesUsage(usage) {
+  if (!usage || typeof usage !== "object") return responsesUsage();
+  const inputTokens = Number.isFinite(usage.input_tokens)
+    ? usage.input_tokens
+    : Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : 0;
+  const outputTokens = Number.isFinite(usage.output_tokens)
+    ? usage.output_tokens
+    : Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0;
+  const totalTokens = Number.isFinite(usage.total_tokens)
+    ? usage.total_tokens
+    : inputTokens + outputTokens;
+  const inputDetails = usage.input_tokens_details && typeof usage.input_tokens_details === "object"
+    ? usage.input_tokens_details : {};
+  const outputDetails = usage.output_tokens_details && typeof usage.output_tokens_details === "object"
+    ? usage.output_tokens_details : {};
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cached_tokens: Number.isFinite(inputDetails.cached_tokens) ? inputDetails.cached_tokens : 0 },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: Number.isFinite(outputDetails.reasoning_tokens) ? outputDetails.reasoning_tokens : 0 },
+    total_tokens: totalTokens,
+  };
+}
+
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
 async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc) {
   const reader = upstreamBody.getReader();
@@ -927,7 +953,7 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc) {
           ? { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] }
           : { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args }
       );
-      resp.usage = usage || responsesUsage();
+      resp.usage = chatUsageToResponsesUsage(usage);
       await send({ type: "response.completed", response: resp });
     } catch {}
     finally { try { await writer.close(); } catch {} }
@@ -997,7 +1023,7 @@ async function responsesToNonStream(upstreamBody, mc) {
   for (const item of toolItems.values()) {
     resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
   }
-  resp.usage = usage || responsesUsage();
+  resp.usage = chatUsageToResponsesUsage(usage);
   return resp;
 }
 
@@ -1032,7 +1058,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.5" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.6" });
 }
 
 function getApiKey(request, env) {
