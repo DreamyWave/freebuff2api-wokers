@@ -35,7 +35,7 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.2",
+        version: "1.6.3",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -312,14 +312,18 @@ async function createSession(token, sessionModel, forceCreate = false) {
     }
   }
 
-  // ad) 刷广告：还原官方 CLI 行为，在创建 session 前上报广告曝光。
-  //      失败静默、超时 5s，完全不影响聊天。
+  // ad) 刷广告 + streak 签到：还原官方 CLI 行为，在创建 session 前上报广告曝光 + 签到。
+  //      官方流程（参考 XxxXTeam/freebuff2api codebuff.py _request_ads_and_streak）：
+  //      广告曝光后调 GET /api/v1/freebuff/streak 签到，连续使用可获 streak 额度加成
+  //      （limit = base + referral + streak）。失败静默、超时 5s，完全不影响聊天。
   try {
     await enqueueUp("POST", "/api/v1/ads", token,
       { provider: "gravity", sessionId: crypto.randomUUID(), surface: "waiting_room",
         device: { os: "windows", timezone: "Asia/Shanghai", locale: "zh-CN" },
         userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" },
       { "Content-Type": "application/json" }, 5000);
+    // streak 签到（v1.6.3）：GET /api/v1/freebuff/streak，0 消耗，连续使用加额度
+    await enqueueUp("GET", "/api/v1/freebuff/streak", token, undefined, undefined, 5000);
   } catch {}
 
   // 2) create（可能 queue）。⚠️ 实测(2026-08-07)：x-freebuff-multi-session:1 创建的实例上游 GET 为
@@ -1004,7 +1008,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.2" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.3" });
 }
 
 function getApiKey(request, env) {
