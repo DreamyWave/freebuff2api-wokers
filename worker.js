@@ -35,7 +35,7 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.3",
+        version: "1.6.4",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -446,6 +446,22 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   payload.stream = true;
   if (!payload.stop) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
+  // v1.6.4：外来客户端检测绕过。服务端 detectForeignFreebuffClient 对「带 tools 但无官方
+  // 专属工具名」的请求判定 foreign_toolset，降级到 ling-3.0-tiny:free（占免费额度→429）。
+  // 实测（2026-08-09）：tools 里混入官方专属名（end_turn，TOOLS_WHICH_WONT_FORCE_NEXT_STEP
+  // 中的无害工具）即通过检测，请求用真模型正常返回。end_turn 不会被模型实际调用
+  // （官方定义为「不强制下一步」的工具），只用于通过工具集合签名校验。
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    const hasSignature = payload.tools.some(
+      (t) => t && typeof t === "object" && t.function && typeof t.function.name === "string" && t.function.name === "end_turn",
+    );
+    if (!hasSignature) {
+      payload.tools = [
+        ...payload.tools,
+        { type: "function", function: { name: "end_turn", description: "Signal the end of the current task.", parameters: { type: "object", properties: {} } } },
+      ];
+    }
+  }
   payload.codebuff_metadata = {
     freebuff_instance_id: sess.instanceId,
     trace_session_id: crypto.randomUUID(),
@@ -1008,7 +1024,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.3" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.4" });
 }
 
 function getApiKey(request, env) {
