@@ -28,7 +28,7 @@ export default {
 
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
-      return jsonResponse({ status: "ok", version: "1.5.0.3", time: new Date().toISOString() }, 200);
+      return jsonResponse({ status: "ok", version: "1.5.0", time: new Date().toISOString() }, 200);
     }
 
     const key = getApiKey(request, env);
@@ -356,13 +356,7 @@ async function handleChat(request, env) {
           "x-freebuff-instance-id": sessForChat.instanceId,
           "User-Agent": "ai-sdk/openai-compatible/0.0.141/codebuff",
         };
-        // ⚠️ 默认不带 x-freebuff-acting-user-id：上游按该头（user_id）独立计额（limit 6/天），
-        // 固定带同一个 FREEBUFF_USER_ID 会让 4 个 token 号共享同一个额度池，一个号用完全 429。
-        // 去掉后上游按 Authorization token 独立计额，多号轮换才能真正生效。
-        // 如需按 user 隔离（如不同 token 配不同 user_id），可显式设置 FREEBUFF_USER_ID。
-        if (env.FREEBUFF_USER_ID && env.FREEBUFF_USER_ID !== "2027142c-e843-443f-b7d0-d636016d37c4") {
-          headers["x-freebuff-acting-user-id"] = env.FREEBUFF_USER_ID;
-        }
+        if (env.FREEBUFF_USER_ID) headers["x-freebuff-acting-user-id"] = env.FREEBUFF_USER_ID;
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
           method: "POST", headers, body: JSON.stringify(payload),
@@ -529,7 +523,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.5.0.3" });
+  }, 200, { "X-Freebuff2api-Version": "1.5.0" });
 }
 
 function getApiKey(request, env) {
