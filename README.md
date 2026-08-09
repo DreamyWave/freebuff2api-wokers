@@ -6,14 +6,14 @@
 > 开源协议：**[MIT](#-license)**
 
 把 **freebuff/codebuff** 的免费模型暴露成 **OpenAI-compatible API** 的 Cloudflare Worker。
-单文件无依赖，**推荐在 CF 控制台直接粘贴代码部署**（也支持 wrangler CLI），适配任意 OpenAI SDK / 客户端（QwenPaw、Hermes、ChatGPT-Next-Web、LobeChat、one-api 等）。
+单文件无依赖，**推荐在 CF 控制台直接粘贴代码部署**，适配任意 OpenAI SDK / 客户端（QwenPaw、Hermes、ChatGPT-Next-Web、LobeChat、one-api 等）。
 
 ## ✨ 特性
 
 - 🔥 **两个模型实测不限量**（见下），其余每日 6 次额度
 - 🔁 **多账号自动切换**：撞额度自动冷却并切换，逗号分隔即可
 - 💡 **优先复用活跃 session**：一个 session 约 1 小时有效，创建 session 才扣额度；只要当前模型的 session 还活跃就钉在同一账号上，用满再换，最大化额度利用率
-- 📢 **广告流程模拟**：创建新 session 前按官方客户端流程请求广告曝光，更接近官方客户端行为；广告请求失败会静默跳过，不阻塞聊天
+- 📢 **广告与 streak 流程兼容**：创建新 session 前，Worker 会按官方客户端流程请求广告，并调用 `GET /api/v1/freebuff/streak` 尝试签到；相关请求失败会静默跳过，不阻塞聊天
 - 🧩 **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`（流式/非流式都支持）
 - ❤️ **健康检查**：`GET /healthz`（免鉴权），方便监控探活
 - 📦 **单文件部署**：无依赖，CF 控制台粘贴即用
@@ -32,6 +32,8 @@
 其余模型每天 **6 次/太平洋日**（24h 窗口，北京时间约 15:00 重置），见下方[完整模型列表](#-模型列表)。
 
 > 💡 **关于额度**：扣额度按「创建 session」计（不是每次对话）。一次 session 约 1 小时有效，期间多轮对话不重复扣。所以 4 个账号 × 每天 6 次 ≈ 全天覆盖。
+>
+> 📝 **广告与 streak 说明**：创建新 session 前，Worker 会按官方客户端流程请求广告，并调用 `GET /api/v1/freebuff/streak` 尝试签到。连续使用是否获得额外额度、额度增加多少，由 freebuff 官方服务端决定；该流程不是额度保证，也不会改变 session 本身的扣额度规则。
 
 ## 🚀 快速开始
 
@@ -94,7 +96,7 @@ python3 extract_freebuff.py tgsend  # 测试 TG 连通性（配了 TG 时用）
 
 ## 🛠️ 部署
 
-worker 是**单文件**（`worker.js`），搭建方式任选：
+worker 是**单文件**（`worker.js`），推荐使用 CF 控制台直接部署：
 
 ### 方式 A：CF 控制台粘贴代码（✅ 推荐）
 
@@ -121,26 +123,7 @@ worker 是**单文件**（`worker.js`），搭建方式任选：
 > 每次改代码只需重复第 3 步：编辑代码 → 粘贴新内容 → 部署。**不推荐关联 GitHub 自动部署**（见下文）。
 > ⚠️ **版本约定**：每次部署前务必把代码里的版本号（healthz 的 `version` 字段 + `X-Freebuff2api-Version` 响应头）升一档，否则无法确认线上是否已更新。
 
-### 方式 B：wrangler CLI（命令行）
-
-```bash
-# 安装 + 登录
-npm i -g wrangler
-npx wrangler login
-
-# 本地开发调试
-cp .env.example .dev.vars   # 填上 FREEBUFF_TOKEN
-npx wrangler dev
-
-# 发布上线
-npx wrangler deploy
-
-# 设置 secrets（部署后执行，CLI 交互式输入）
-npx wrangler secret put FREEBUFF_TOKEN
-npx wrangler secret put FREEBUFF_API_KEY
-```
-
-### 方式 C：关联 GitHub 自动部署（❌ 不推荐）
+### 关联 GitHub 自动部署（❌ 不推荐）
 
 虽然 CF 支持连接 GitHub 仓库自动部署，但**不建议用**：
 
