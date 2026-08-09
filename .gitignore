@@ -20,3 +20,8 @@ CHANGELOG.md
 
 # ⚠️ wrangler.toml 含敏感变量（FREEBUFF_TOKEN 等），绝不提交 GitHub
 wrangler.toml
+
+# ⚠️ .env 及所有带真实变量值的文件，绝不提交（.env.example 模板除外）
+.env
+.env.*
+!.env.example
