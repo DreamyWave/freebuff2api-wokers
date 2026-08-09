@@ -29,7 +29,7 @@ export default {
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
       const acctCount = parseAccounts(env).length;
-      return jsonResponse({ status: "ok", version: "1.5.0.2", accounts: acctCount, time: new Date().toISOString() }, 200);
+      return jsonResponse({ status: "ok", version: "1.5.0.4", accounts: acctCount, time: new Date().toISOString() }, 200);
     }
 
     const key = getApiKey(request, env);
@@ -99,6 +99,12 @@ function cooldown(token, ms) {
 }
 
 function parseCooldown(text, status) {
+  // 优先解析 JSON 里的 retryAfterMs（luna 等模型 429 返回 {"retryAfterMs": 15506639}）
+  const jm = (text || "").match(/"retryAfterMs"\s*:\s*(\d+)/);
+  if (jm) {
+    const ms = parseInt(jm[1], 10);
+    if (ms > 0) return Math.min(ms, 6 * 3600 * 1000);
+  }
   const m = (text || "").match(/try again in (?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
   if (m) {
     const ms = (parseInt(m[1]||0,10)*3600 + parseInt(m[2]||0,10)*60 + parseInt(m[3]||0,10)) * 1000;
@@ -446,7 +452,13 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           "x-freebuff-instance-id": sessForChat.instanceId,
           "User-Agent": "ai-sdk/openai-compatible/0.0.141/codebuff",
         };
-        if (env.FREEBUFF_USER_ID) headers["x-freebuff-acting-user-id"] = env.FREEBUFF_USER_ID;
+        // ⚠️ 默认不带 x-freebuff-acting-user-id：上游按该头（user_id）独立计额（limit 6/天），
+        // 固定带同一个 FREEBUFF_USER_ID 会让 4 个 token 号共享同一个额度池，一个号用完全 429。
+        // 去掉后上游按 Authorization token 独立计额，多号轮换才能真正生效。
+        // 如需按 user 隔离（如不同 token 配不同 user_id），可显式设置 FREEBUFF_USER_ID。
+        if (env.FREEBUFF_USER_ID && env.FREEBUFF_USER_ID !== "2027142c-e843-443f-b7d0-d636016d37c4") {
+          headers["x-freebuff-acting-user-id"] = env.FREEBUFF_USER_ID;
+        }
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
           method: "POST", headers, body: JSON.stringify(payload),
@@ -492,8 +504,11 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
       // 任何上游交互失败/超时（含 chat fetch 20s abort）都冷却当前号，继续换下一个号
+      // ⚠️ createSession 429（额度耗尽）按 retryAfterMs/文本冷却（luna 可达数小时），
+      // 不能固定 60s——否则冷却完又进池子反复撞 429。
       if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
-        cooldown(token, 60 * 1000);
+        const m429 = msg.match(/429/);
+        cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
       }
       lastErrMsg = msg;
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
@@ -861,7 +876,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.5.0.2" });
+  }, 200, { "X-Freebuff2api-Version": "1.5.0.4" });
 }
 
 function getApiKey(request, env) {
