@@ -35,7 +35,7 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.1",
+        version: "1.6.2",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -103,6 +103,9 @@ const PROBE_TTL_MS = 10 * 60 * 1000; // 探测结果缓存 10 分钟，避免每
  * - 200 → { alive: true, uid: data.id }（uid = 真实账号 id，自动发现）
  * - 401 → { alive: false }（token 失效）
  * - 其他/网络错误 → 不判定失效（返回 null 由调用方决定是否信任缓存）
+ * 
+ * 额外：GET /api/v1/freebuff/session 拿 rateLimitsByModel → quota（recentCount/limit），
+ * 供 pickToken 按剩余额度选号（v1.6.2）。GET 不建 session，0 消耗。
  */
 async function probeAccount(token) {
   const cached = acctHealth.get(token);
@@ -110,7 +113,14 @@ async function probeAccount(token) {
   try {
     const r = await enqueueUp("GET", "/api/v1/me", token, undefined, undefined, SESSION_TIMEOUT_MS);
     if (r.status === 200 && r.data && typeof r.data.id === "string") {
-      const info = { alive: true, uid: r.data.id, checkedAt: Date.now() };
+      const info = { alive: true, uid: r.data.id, checkedAt: Date.now(), quota: null };
+      // 顺便查额度（0 消耗，GET 不建 session）
+      try {
+        const s = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, undefined, SESSION_TIMEOUT_MS);
+        if (s.status === 200 && s.data && s.data.rateLimitsByModel) {
+          info.quota = s.data.rateLimitsByModel; // { model: { recentCount, limit, ... } }
+        }
+      } catch {}
       acctHealth.set(token, info);
       return info;
     }
@@ -147,11 +157,27 @@ function pickToken(env, sessionModel) {
   });
   const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
 
+  // v1.6.2：按剩余额度排序（优先选剩余最多的号，剩余<=0的跳过）
+  // quota 数据来自 probeAccount 的 GET /freebuff/session（rateLimitsByModel，0 消耗）
+  const quotaSorted = [...usePool].sort((a, b) => {
+    const ra = remainingQuota(a.token, sessionModel);
+    const rb = remainingQuota(b.token, sessionModel);
+    if (ra === null && rb === null) return 0;
+    if (ra === null) return 1;  // 无数据排后面（保底）
+    if (rb === null) return -1;
+    return rb - ra;  // 剩余多的优先
+  });
+  const withQuota = quotaSorted.filter((a) => {
+    const r = remainingQuota(a.token, sessionModel);
+    return r !== null && r > 0;
+  });
+  const finalPool = withQuota.length > 0 ? withQuota : quotaSorted; // 全部耗尽时回退排序池（仍有额度概念）
+
   // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
   // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
   // 浪费创建额度。只要当前模型的 session 缓存还活跃就钉在同一个号上，用满再换。
   if (sessionModel) {
-    for (const acct of usePool) {
+    for (const acct of finalPool) {
       const t = acct.token;
       if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
       const cached = sessCache.get(t + ":" + sessionModel);
@@ -162,9 +188,9 @@ function pickToken(env, sessionModel) {
   }
 
   // 没有活跃缓存才轮询（跳过冷却中的号）
-  for (let k = 0; k < usePool.length; k++) {
-    const acct = usePool[accountIdx % usePool.length];
-    accountIdx = (accountIdx + 1) % usePool.length;
+  for (let k = 0; k < finalPool.length; k++) {
+    const acct = finalPool[accountIdx % finalPool.length];
+    accountIdx = (accountIdx + 1) % finalPool.length;
     const t = acct.token;
     if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
   }
@@ -175,6 +201,26 @@ function pickToken(env, sessionModel) {
 
 function cooldown(token, ms) {
   if (ms > 0) cooldowns.set(token, Date.now() + ms);
+}
+
+/**
+ * 计算某 token 某模型的剩余额度（limit - recentCount）。
+ * - 无 quota 数据 → null（不参与额度排序，保底）
+ * - quota 里找不到该模型 → 用任意模型的最近值（额度是账号级共享的）
+ * - 剩余 <= 0 → 该号额度耗尽（跳过）
+ */
+function remainingQuota(token, sessionModel) {
+  const h = acctHealth.get(token);
+  if (!h || !h.quota) return null;
+  let entry = h.quota[sessionModel];
+  if (!entry) {
+    // 取第一个模型的额度（免费额度账号级共享，各模型 recentCount 相同）
+    const keys = Object.keys(h.quota);
+    if (keys.length === 0) return null;
+    entry = h.quota[keys[0]];
+  }
+  if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return null;
+  return entry.limit - entry.recentCount;
 }
 
 function parseCooldown(text, status) {
@@ -958,7 +1004,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.1" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.2" });
 }
 
 function getApiKey(request, env) {
