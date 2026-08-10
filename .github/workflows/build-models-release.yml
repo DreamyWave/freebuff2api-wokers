@@ -6,7 +6,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # 提交 MODELS.md 到 main
+  actions: write    # 清理旧 run 记录（gh run delete）
 
 jobs:
   build-models:
