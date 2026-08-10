@@ -21,10 +21,32 @@ const MODELS = [
   { id: "meta/muse-spark-1.2-contributor", session: "meta/muse-spark-1.2-contributor", agent: "base2-free-muse-spark", upstream: "meta/muse-spark-1.2-contributor" },
 ];
 
-// Quota pools are used only to choose an account. They NEVER change the model
-// selected by the caller: mc.session/mc.upstream always remain the requested
-// model. Web's four premium models share one daily session pool; Flash and MiMo
-// are standard models and must not borrow a premium quota snapshot.
+// ---------------------------------------------------------------------------
+// 额度池说明（逆向自官方源码 freebuff-models.ts，2026-08-10 实证）
+//
+// 官方三种额度池（都是 session 次数，非 token 数）：
+//   1. PREMIUM 池：共享 6 次/天（FREEBUFF_PREMIUM_SESSION_LIMIT=6）
+//      m3 / v4-pro / luna / laguna-s-2.1 / muse-spark / greg-2 等
+//      （FREEBUFF_WEB_PREMIUM_MODEL_IDS）
+//   2. STANDARD 池：浏览器/Web 端 6 次/天
+//      （FREEBUFF_WEB_STANDARD_SESSION_LIMIT=6；= 所有非 premium 模型，
+//      即 Flash / MiMo 2.5 等。FREEBUFF_WEB_STANDARD_MODEL_IDS）
+//      ⚠️ 注释原文："The CLI keeps these models UNLIMITED; browser surfaces
+//      cap fresh sessions to deter automated project/session churn."
+//      → CLI 协议 Flash 无限，但 CLI 已被官方封堵（free_mode_cli_required）；
+//        桌面版/Web 协议下 Flash 同样受 6 次/天限制
+//   3. GLM 5.2 池：独立，referral 解锁（不计入以上）
+//
+// 桌面版并发桶（FREEBUFF_DESKTOP_SESSION_LIMITS，仅限并发非额度）：
+//   premium:  1  ← Premium 模型每用户同时 1 个活跃 session
+//   unlimited: 3 ← Flash/MiMo 每用户最多 3 个并发 tab
+//   limited 访问层（无 Premium 的号）：所有模型都占 1 个 slot
+//   （occupiesFreebuffDesktopSlot / getFreebuffDesktopSessionBucket）
+//
+// 对 1.7.0 的意义：单号串行时每天上限 = Premium 6 + Flash 6（07:00 UTC
+// 太平洋日重置）。并发到多号会同时烧各号额度，无法靠并发突破 6 次/天。
+// 额度池只用于选号，绝不改变调用方请求的模型。
+// ---------------------------------------------------------------------------
 const PREMIUM_QUOTA_MODELS = new Set([
   "deepseek/deepseek-v4-pro",
   "openai/gpt-5.6-luna",
