@@ -81,7 +81,7 @@ export default {
       const probes = await probeAllAccounts(env);
       const aliveCount = probes.filter((p) => p.alive === true).length;
       const unknownCount = probes.filter((p) => p.alive === null).length;
-      // v1.7.1：按 state 分组统计（区分额度用完 vs 封控）
+      // v1.7.2：按 state 分组统计（区分额度用完 vs 封控）
       const stateCount = {};
       for (const p of probes) {
         const s = p.state || "unknown";
@@ -89,7 +89,7 @@ export default {
       }
       return jsonResponse({
         status: "ok",
-        version: "1.7.1",
+        version: "1.7.2",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -105,7 +105,12 @@ export default {
     }
 
     const key = getApiKey(request, env);
-    if (!key) return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
+    if (!key) {
+      if (url.pathname === "/v1/messages" || url.pathname === "/messages" || url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens") {
+        return anthropicError("Invalid API key", "authentication_error", 401);
+      }
+      return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
+    }
 
     cleanCache();
 
@@ -118,8 +123,11 @@ export default {
     if (request.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
       return handleResponses(request, env);
     }
+    if (request.method === "POST" && (url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens")) {
+      return handleAnthropicCountTokens(request, env);
+    }
     if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
-      return jsonResponse({ error: { message: "Anthropic endpoint not yet implemented", type: "not_implemented" } }, 501);
+      return handleAnthropicMessages(request, env);
     }
     return jsonResponse({ error: { message: "Not found", type: "not_found" } }, 404);
   },
@@ -168,7 +176,7 @@ async function probeAccount(token) {
   const cached = acctHealth.get(token);
   if (cached && Date.now() - cached.checkedAt < PROBE_TTL_MS) return cached;
   try {
-    // v1.7.1：改用 GET /freebuff/session 探测状态（0 消耗），
+    // v1.7.2：改用 GET /freebuff/session 探测状态（0 消耗），
     // 官方源码 freebuff-session-api.ts 判定：
     //   200 + status:active/none        → 正常
     //   404                            → 无 session，账号正常
@@ -707,7 +715,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
         const staleSession =
           (resp.status === 428 && errText.includes("waiting_room_required")) ||
-          (resp.status === 409 && errText.includes("session_superseded"));
+          (resp.status === 409 && errText.includes("session_superseded")) ||
+          (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
         if (staleSession && attempt === 0) {
           sessCache.delete(token + ":" + mc.session);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
@@ -756,8 +765,180 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
 
 
 // ---------------------------------------------------------------------------
-// SSE 处理
+// Anthropic Messages API（本地适配，复用稳定的 executeChat 主链路）
 // ---------------------------------------------------------------------------
+function anthropicModelToOpenAI(model) {
+  const raw = String(model || DEFAULT_MODEL).trim();
+  if (MODELS.some((m) => m.id === raw)) return raw;
+  const short = raw.replace(/^anthropic\//, "");
+  const hit = MODELS.find((m) => m.id.toLowerCase().endsWith("/" + short.toLowerCase()));
+  return hit ? hit.id : DEFAULT_MODEL;
+}
+
+function anthropicText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((p) => p && p.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n");
+}
+
+function anthropicContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const out = [];
+  for (const p of content) {
+    if (!p || typeof p !== "object") continue;
+    if (p.type === "text" && typeof p.text === "string") out.push({ type: "text", text: p.text });
+    if (p.type === "image" && p.source && typeof p.source === "object") {
+      const s = p.source;
+      if (s.type === "base64" && s.media_type && s.data) out.push({ type: "image_url", image_url: { url: `data:${s.media_type};base64,${s.data}` } });
+      else if (s.type === "url" && s.url) out.push({ type: "image_url", image_url: { url: s.url } });
+    }
+  }
+  return out;
+}
+
+function anthropicToChat(body, mc) {
+  const chat = { model: mc.id, stream: !!body.stream, messages: [] };
+  if (body.stream) chat.stream_options = { include_usage: true };
+  const system = anthropicText(body.system);
+  if (system) chat.messages.push({ role: "system", content: system });
+  if (body.max_tokens != null) chat.max_completion_tokens = body.max_tokens;
+  for (const k of ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"]) if (body[k] != null) chat[k] = body[k];
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) chat.stop = body.stop_sequences;
+  if (body.thinking?.type === "enabled" && Number.isFinite(body.thinking.budget_tokens)) chat.reasoning_effort = body.thinking.budget_tokens >= 16000 ? "high" : body.thinking.budget_tokens >= 8000 ? "medium" : "low";
+  if (body.metadata && typeof body.metadata === "object") chat.metadata = body.metadata;
+
+  if (Array.isArray(body.tools) && body.tools.length) {
+    chat.tools = body.tools.filter((t) => t && t.name).map((t) => ({ type: "function", function: { name: t.name, description: t.description || "", parameters: t.input_schema || { type: "object", properties: {} } } }));
+    const tc = body.tool_choice;
+    if (tc?.type === "auto") chat.tool_choice = "auto";
+    else if (tc?.type === "any") chat.tool_choice = "required";
+    else if (tc?.type === "none") chat.tool_choice = "none";
+    else if (tc?.type === "tool" && tc.name) chat.tool_choice = { type: "function", function: { name: tc.name } };
+  }
+
+  for (const m of Array.isArray(body.messages) ? body.messages : []) {
+    if (!m || typeof m !== "object") continue;
+    if (m.role === "user") {
+      const parts = Array.isArray(m.content) ? m.content : [];
+      const results = parts.filter((p) => p && p.type === "tool_result");
+      if (results.length) {
+        for (const p of results) chat.messages.push({ role: "tool", tool_call_id: p.tool_use_id || "", content: anthropicContent(p.content) });
+        const text = parts.filter((p) => p && p.type === "text" && p.text).map((p) => p.text).join("\n");
+        if (text) chat.messages.push({ role: "user", content: text });
+      } else chat.messages.push({ role: "user", content: anthropicContent(m.content) });
+    } else if (m.role === "assistant") {
+      const uses = Array.isArray(m.content) ? m.content.filter((p) => p && p.type === "tool_use") : [];
+      if (uses.length) chat.messages.push({ role: "assistant", content: anthropicText(m.content), tool_calls: uses.map((p) => ({ id: p.id || ("call_" + Math.random().toString(36).slice(2, 10)), type: "function", function: { name: p.name || "", arguments: JSON.stringify(p.input ?? {}) } })) });
+      else chat.messages.push({ role: "assistant", content: anthropicText(m.content) });
+    }
+  }
+  return chat;
+}
+
+function anthropicStopReason(reason) {
+  if (reason === "tool_calls") return "tool_use";
+  if (reason === "length") return "max_tokens";
+  return "end_turn";
+}
+
+function anthropicFromChat(oai, mc) {
+  const choice = oai?.choices?.[0] || {};
+  const msg = choice.message || {};
+  const content = [];
+  if (msg.content) content.push({ type: "text", text: msg.content });
+  for (const tc of msg.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+    content.push({ type: "tool_use", id: tc.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: tc.function?.name || "", input });
+  }
+  if (!content.length) content.push({ type: "text", text: "" });
+  const u = oai?.usage || {};
+  return { id: oai?.id || ("msg_" + Math.random().toString(36).slice(2, 10)), type: "message", role: "assistant", model: mc.id, content, stop_reason: anthropicStopReason(choice.finish_reason), stop_sequence: null, usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 } };
+}
+
+function anthropicError(message, type, status, retryAfter) {
+  const headers = { ...corsHeaders() };
+  if (retryAfter) headers["Retry-After"] = String(retryAfter);
+  return jsonResponse({ type: "error", error: { type: type || "api_error", message: String(message || "Upstream error") } }, status || 500, headers);
+}
+
+function estimateAnthropicTokens(value) {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) return value.reduce((n, x) => n + estimateAnthropicTokens(x), 0);
+  if (value && typeof value === "object") return Object.entries(value).reduce((n, [k, v]) => n + k.length + estimateAnthropicTokens(v), 0);
+  return 0;
+}
+
+async function handleAnthropicCountTokens(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
+  const mc = MODELS.find((m) => m.id === anthropicModelToOpenAI(body.model)) || MODELS[0];
+  const chat = anthropicToChat(body, mc);
+  return jsonResponse({ input_tokens: Math.max(1, Math.ceil(estimateAnthropicTokens(chat.messages) / 4)) }, 200);
+}
+
+function anthropicStream(mc) {
+  const decoder = new TextDecoder();
+  let buffer = "", started = false, ended = false, block = null, blockIndex = -1, reason = "end_turn", input = 0, output = 0;
+  const encoder = new TextEncoder();
+  const events = (ctl, name, data) => { if (!data.type) data.type = name; ctl.enqueue(encoder.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`)); };
+  const close = (ctl) => { if (block) { events(ctl, "content_block_stop", { index: block.index }); block = null; } };
+  const end = (ctl) => {
+    if (ended) return; ended = true;
+    if (!started) events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } });
+    close(ctl);
+    events(ctl, "message_delta", { delta: { stop_reason: reason, stop_sequence: null }, usage: { output_tokens: output } });
+    events(ctl, "message_stop", {});
+  };
+  return new TransformStream({
+    transform(chunk, ctl) {
+      if (ended) return;
+      buffer += decoder.decode(chunk, { stream: true });
+      let pos;
+      while ((pos = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, pos).trim(); buffer = buffer.slice(pos + 1);
+        if (!line.startsWith("data:")) continue;
+        const raw = line.slice(5).trim();
+        if (raw === "[DONE]") { end(ctl); continue; }
+        let obj; try { obj = JSON.parse(raw); } catch { continue; }
+        if (obj.usage) { input = obj.usage.prompt_tokens ?? input; output = obj.usage.completion_tokens ?? output; }
+        const choice = obj.choices?.[0]; if (!choice) continue;
+        const delta = choice.delta || {};
+        if (!started) { started = true; events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } }); }
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const fn = tc.function || {}; const idx = tc.index ?? 0;
+            if (!block || block.kind !== "tool" || block.sourceIndex !== idx) { close(ctl); block = { index: ++blockIndex, kind: "tool", sourceIndex: idx }; events(ctl, "content_block_start", { index: block.index, content_block: { type: "tool_use", id: tc.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: fn.name || "", input: {} } }); }
+            if (fn.arguments) events(ctl, "content_block_delta", { index: block.index, delta: { type: "input_json_delta", partial_json: fn.arguments } });
+          }
+        } else if (delta.content) {
+          if (!block || block.kind !== "text") { close(ctl); block = { index: ++blockIndex, kind: "text" }; events(ctl, "content_block_start", { index: block.index, content_block: { type: "text", text: "" } }); }
+          events(ctl, "content_block_delta", { index: block.index, delta: { type: "text_delta", text: delta.content } });
+        }
+        if (choice.finish_reason) reason = anthropicStopReason(choice.finish_reason);
+      }
+    },
+    flush(ctl) { end(ctl); },
+  });
+}
+
+async function handleAnthropicMessages(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
+  const mc = MODELS.find((m) => m.id === anthropicModelToOpenAI(body.model)) || MODELS[0];
+  const chat = anthropicToChat(body, mc);
+  const response = await executeChat(env, chat, mc, !!chat.stream, "chat");
+  if (response.status >= 400) {
+    let msg = "Upstream error"; try { const data = await response.json(); msg = data?.error?.message || msg; } catch {}
+    const types = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 429: "rate_limit_error", 503: "overloaded_error" };
+    return anthropicError(msg, types[response.status] || "api_error", response.status, response.headers.get("Retry-After"));
+  }
+  if (!chat.stream) return jsonResponse(anthropicFromChat(await response.json(), mc), response.status);
+  return new Response(response.body.pipeThrough(anthropicStream(mc)), { status: response.status, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
+}
+
+
 
 function unwrapData(obj) {
   if (obj && obj.data && typeof obj.data === "object" && (obj.data.choices || obj.data.id || obj.data.usage)) return obj.data;
@@ -1139,7 +1320,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.7.1" });
+  }, 200, { "X-Freebuff2api-Version": "1.7.2" });
 }
 
 function getApiKey(request, env) {
