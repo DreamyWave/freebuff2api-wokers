@@ -77,19 +77,27 @@ export default {
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
       const acctCount = parseAccounts(env).length;
-      // v1.6.0：探测全部账号（GET /api/v1/me，0 消耗），返回存活数
+      // v1.6.0：探测全部账号（GET /api/v1/freebuff/session，0 消耗），返回存活数
       const probes = await probeAllAccounts(env);
       const aliveCount = probes.filter((p) => p.alive === true).length;
       const unknownCount = probes.filter((p) => p.alive === null).length;
+      // v1.7.1：按 state 分组统计（区分额度用完 vs 封控）
+      const stateCount = {};
+      for (const p of probes) {
+        const s = p.state || "unknown";
+        stateCount[s] = (stateCount[s] || 0) + 1;
+      }
       return jsonResponse({
         status: "ok",
-        version: "1.7.0",
+        version: "1.7.1",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
+        account_states: stateCount, // { ok: n, banned: n, rate_limited: n, ... }
         account_details: probes.map((p) => ({
           token: p.token.slice(0, 8) + "...",
           alive: p.alive,
+          state: p.state, // ok / banned / rate_limited / token_invalid / country_blocked / blocked / model_locked / ip_capped / unknown
           uid: p.uid ? p.uid.slice(0, 8) + "..." : null, // 脱敏：uid 也是敏感账号 id，不完整暴露
         })),
         time: new Date().toISOString(),
@@ -160,32 +168,47 @@ async function probeAccount(token) {
   const cached = acctHealth.get(token);
   if (cached && Date.now() - cached.checkedAt < PROBE_TTL_MS) return cached;
   try {
-    const r = await enqueueUp("GET", "/api/v1/me", token, undefined, undefined, SESSION_TIMEOUT_MS);
-    if (r.status === 200 && r.data && typeof r.data.id === "string") {
-      const info = { alive: true, uid: r.data.id, checkedAt: Date.now(), quota: null };
-      // 顺便查额度（0 消耗，GET 不建 session）
-      try {
-        const s = await enqueueUp(
-          "GET",
-          "/api/v1/freebuff/session",
-          token,
-          undefined,
-          DESKTOP_INCLUDE_RATE_LIMITS,
-          SESSION_TIMEOUT_MS,
-        );
-        if (s.status === 200 && s.data && s.data.rateLimitsByModel) {
-          info.quota = s.data.rateLimitsByModel; // { model: { recentCount, limit, ... } }
-        }
-      } catch {}
-      acctHealth.set(token, info);
-      return info;
+    // v1.7.1：改用 GET /freebuff/session 探测状态（0 消耗），
+    // 官方源码 freebuff-session-api.ts 判定：
+    //   200 + status:active/none        → 正常
+    //   404                            → 无 session，账号正常
+    //   403 + status:banned            → 封控（Terminal，不可恢复）
+    //   403 + status:country_blocked   → 地区受限
+    //   401                            → token 失效
+    //   429 + status:rate_limited      → 额度用完（当天 session 数用尽）
+    const r = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
+      DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
+    let state = "unknown", uid = null, quota = null;
+    if (r.status === 200 && r.data && typeof r.data === "object") {
+      const st = r.data.status;
+      if (st === "banned") state = "banned";
+      else if (st === "country_blocked") state = "country_blocked";
+      else if (st === "rate_limited") state = "rate_limited";
+      else if (st === "model_locked") state = "model_locked";
+      else if (st === "ip_capped") state = "ip_capped";
+      else state = "ok"; // active / none / ended 都算可用
+      if (r.data.rateLimitsByModel) quota = r.data.rateLimitsByModel;
+      // session 接口不返回 uid，需要时再补 /me（不阻塞主探测）
+      if (state === "ok") {
+        try {
+          const m = await enqueueUp("GET", "/api/v1/me", token, undefined, undefined, SESSION_TIMEOUT_MS);
+          if (m.status === 200 && m.data && typeof m.data.id === "string") uid = m.data.id;
+        } catch {}
+      }
+    } else if (r.status === 404) {
+      state = "ok"; // 无 session，账号正常
+    } else if (r.status === 401) {
+      state = "token_invalid";
+    } else if (r.status === 403) {
+      // 403 但 body 里没有可识别 status：区分 401 之外的拒绝
+      const st = r.data && typeof r.data === "object" ? r.data.status : null;
+      state = st === "banned" ? "banned" : (st === "country_blocked" ? "country_blocked" : "blocked");
+    } else if (r.status === 429) {
+      state = "rate_limited";
     }
-    if (r.status === 401 || r.status === 403) {
-      const info = { alive: false, uid: null, checkedAt: Date.now() };
-      acctHealth.set(token, info);
-      return info;
-    }
-    return null; // 网络错误/其他状态：不判定
+    const info = { alive: state === "ok", state, uid, quota, checkedAt: Date.now() };
+    acctHealth.set(token, info);
+    return info;
   } catch {
     return null;
   }
@@ -197,7 +220,12 @@ async function probeAllAccounts(env) {
   const results = [];
   for (const acct of pool) {
     const info = await probeAccount(acct.token);
-    results.push({ token: acct.token, alive: info ? info.alive : null, uid: info ? info.uid : null });
+    results.push({
+      token: acct.token,
+      alive: info ? info.alive : null,
+      state: info ? info.state : null,
+      uid: info ? info.uid : null,
+    });
   }
   return results;
 }
@@ -1111,7 +1139,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.7.0" });
+  }, 200, { "X-Freebuff2api-Version": "1.7.1" });
 }
 
 function getApiKey(request, env) {
