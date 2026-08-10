@@ -21,6 +21,21 @@ const MODELS = [
   { id: "meta/muse-spark-1.2-contributor", session: "meta/muse-spark-1.2-contributor", agent: "base2-free-muse-spark", upstream: "meta/muse-spark-1.2-contributor" },
 ];
 
+// Quota pools are used only to choose an account. They NEVER change the model
+// selected by the caller: mc.session/mc.upstream always remain the requested
+// model. Web's four premium models share one daily session pool; Flash and MiMo
+// are standard models and must not borrow a premium quota snapshot.
+const PREMIUM_QUOTA_MODELS = new Set([
+  "deepseek/deepseek-v4-pro",
+  "openai/gpt-5.6-luna",
+  "minimax/minimax-m3",
+  "meta/muse-spark-1.2-contributor",
+]);
+const STANDARD_MODELS = new Set([
+  "deepseek/deepseek-v4-flash",
+  "mimo/mimo-v2.5",
+]);
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -35,7 +50,7 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.6",
+        version: "1.6.7",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -165,8 +180,9 @@ function pickToken(env, sessionModel) {
   });
   const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
 
-  // v1.6.2：按剩余额度排序（优先选剩余最多的号，剩余<=0的跳过）
-  // quota 数据来自 probeAccount 的 GET /freebuff/session（rateLimitsByModel，0 消耗）
+  // v1.6.7：按用户请求的模型所属额度池选择账号；额度判断只影响账号，
+  // 永远不替换用户请求的模型。Premium 四模型共享一个池；Flash/MiMo
+  // 是普通模型，不借用 Premium 快照。
   const quotaSorted = [...usePool].sort((a, b) => {
     const ra = remainingQuota(a.token, sessionModel);
     const rb = remainingQuota(b.token, sessionModel);
@@ -214,18 +230,23 @@ function cooldown(token, ms) {
 /**
  * 计算某 token 某模型的剩余额度（limit - recentCount）。
  * - 无 quota 数据 → null（不参与额度排序，保底）
- * - quota 里找不到该模型 → 用任意模型的最近值（额度是账号级共享的）
+ * - Premium 模型缺少自身字段 → 仅使用同一 Premium 池内其他模型的快照
+ * - Standard 模型不读取 Premium 快照；其额度由实际 session 响应判断
  * - 剩余 <= 0 → 该号额度耗尽（跳过）
  */
 function remainingQuota(token, sessionModel) {
   const h = acctHealth.get(token);
   if (!h || !h.quota) return null;
   let entry = h.quota[sessionModel];
-  if (!entry) {
-    // 取第一个模型的额度（免费额度账号级共享，各模型 recentCount 相同）
-    const keys = Object.keys(h.quota);
-    if (keys.length === 0) return null;
-    entry = h.quota[keys[0]];
+  if (!entry && PREMIUM_QUOTA_MODELS.has(sessionModel)) {
+    // 只在同一个 Premium 共享池内寻找代表性快照，绝不跨到
+    // Flash/MiMo 或其他模型；这只是额度池判断，不会改变请求模型。
+    for (const model of PREMIUM_QUOTA_MODELS) {
+      if (h.quota[model]) {
+        entry = h.quota[model];
+        break;
+      }
+    }
   }
   if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return null;
   return entry.limit - entry.recentCount;
@@ -1058,7 +1079,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.6" });
+  }, 200, { "X-Freebuff2api-Version": "1.6.7" });
 }
 
 function getApiKey(request, env) {
