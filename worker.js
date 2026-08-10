@@ -1,6 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
+const VERSION = "1.8.3";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 模型 → session 用模型名 / 上游 agentId / 上游 chat 模型名
@@ -89,7 +90,7 @@ export default {
       }
       return jsonResponse({
         status: "ok",
-        version: "1.7.2",
+        version: VERSION,
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -172,9 +173,9 @@ const PROBE_TTL_MS = 10 * 60 * 1000; // 探测结果缓存 10 分钟，避免每
  * 供 pickToken 按剩余额度选号（v1.6.2）。GET 不建 session，0 消耗。
  * 服务端可能默认返回 compact 响应；显式请求完整额度快照，避免 quota 探测退化。
  */
-async function probeAccount(token) {
+async function probeAccount(token, forceRefresh = false) {
   const cached = acctHealth.get(token);
-  if (cached && Date.now() - cached.checkedAt < PROBE_TTL_MS) return cached;
+  if (!forceRefresh && cached && Date.now() - cached.checkedAt < PROBE_TTL_MS) return cached;
   try {
     // v1.7.2：改用 GET /freebuff/session 探测状态（0 消耗），
     // 官方源码 freebuff-session-api.ts 判定：
@@ -214,7 +215,14 @@ async function probeAccount(token) {
     } else if (r.status === 429) {
       state = "rate_limited";
     }
-    const info = { alive: state === "ok", state, uid, quota, checkedAt: Date.now() };
+    const info = {
+      alive: state === "ok",
+      state,
+      uid,
+      quota,
+      retryAfterMs: r.data && typeof r.data.retryAfterMs === "number" ? r.data.retryAfterMs : null,
+      checkedAt: Date.now(),
+    };
     acctHealth.set(token, info);
     return info;
   } catch {
@@ -304,6 +312,9 @@ function cooldown(token, ms) {
  * - 剩余 <= 0 → 该号额度耗尽（跳过）
  */
 function remainingQuota(token, sessionModel) {
+  // STANDARD 的 rateLimitsByModel 目前不是可靠的剩余次数 oracle；
+  // 不用它跳过账号，交给真实 session/chat 响应决定是否切号。
+  if (STANDARD_MODELS.has(sessionModel)) return null;
   const h = acctHealth.get(token);
   if (!h || !h.quota) return null;
   let entry = h.quota[sessionModel];
@@ -321,6 +332,25 @@ function remainingQuota(token, sessionModel) {
   return entry.limit - entry.recentCount;
 }
 
+// 长流不应因为固定秒数被误杀：只有上游额度探测明确表示不可用时，
+// 才允许当前请求中止并切换账号。探测失败/额度未知一律不判定耗尽。
+function isQuotaExhausted(info, sessionModel) {
+  if (!info) return false;
+  if (["rate_limited", "banned", "country_blocked", "token_invalid", "blocked", "model_locked", "ip_capped"].includes(info.state)) return true;
+  // STANDARD 没有可靠的剩余次数查询；只处理明确的账号/上游状态，
+  // 不根据 rateLimitsByModel 的 STANDARD 数字判断耗尽。
+  if (STANDARD_MODELS.has(sessionModel)) return false;
+  if (!info.quota) return false;
+  let entry = info.quota[sessionModel];
+  if (!entry && PREMIUM_QUOTA_MODELS.has(sessionModel)) {
+    for (const model of PREMIUM_QUOTA_MODELS) {
+      if (info.quota[model]) { entry = info.quota[model]; break; }
+    }
+  }
+  if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return false;
+  return entry.limit - entry.recentCount <= 0;
+}
+
 function parseCooldown(text, status) {
   // 优先解析 JSON 里的 retryAfterMs（luna 等模型 429 返回 {"retryAfterMs": 15506639}）
   const jm = (text || "").match(/"retryAfterMs"\s*:\s*(\d+)/);
@@ -334,6 +364,37 @@ function parseCooldown(text, status) {
     if (ms > 0) return Math.min(ms, 6*3600*1000);
   }
   return status === 429 ? 5*60*1000 : 60*1000;
+}
+
+class QuotaExhaustedError extends Error {
+  constructor(info) {
+    super("upstream account quota exhausted");
+    this.name = "QuotaExhaustedError";
+    this.retryAfterMs = info && typeof info.retryAfterMs === "number" ? info.retryAfterMs : null;
+  }
+}
+
+class EmptyUpstreamStreamError extends Error {
+  constructor() {
+    super("upstream returned an empty stream");
+    this.name = "EmptyUpstreamStreamError";
+  }
+}
+
+function invalidateSessionCache(token) {
+  const prefix = token + ":";
+  for (const key of sessCache.keys()) {
+    if (key.startsWith(prefix)) sessCache.delete(key);
+  }
+}
+
+async function deleteUpstreamSession(token, instanceId) {
+  invalidateSessionCache(token);
+  if (!instanceId) return;
+  try {
+    await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
+      { "x-freebuff-instance-id": instanceId }, SESSION_TIMEOUT_MS);
+  } catch {}
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +414,9 @@ function enqueue(fn) {
 const UPSTREAM_TIMEOUT_MS = 20000; // 上游单请求超时，避免客户端干等
 const NONSTREAM_TIMEOUT_MS = 45000; // 非流式要聚合完整上游流（含推理），给更充裕时间
 const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
+// 这不是流式请求的失败时间，只是首个数据迟迟未到时启动一次额度探测的观察窗口。
+// 额度仍在时不 abort、不切号，继续等待上游。
+const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   const headers = {};
@@ -375,6 +439,74 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
 
 function enqueueUp(method, path, token, body, extraHeaders, timeoutMs) {
   return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs));
+}
+
+async function freshQuotaProbe(token, sessionModel) {
+  const info = await probeAccount(token, true);
+  if (isQuotaExhausted(info, sessionModel)) throw new QuotaExhaustedError(info);
+}
+
+// 流式 chat 不设置总时长 abort。只有在首个数据迟迟未到时，
+// 才强制刷新账号额度；额度未知或仍有额度时，原请求继续等待。
+async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
+  const controller = new AbortController();
+  const request = fetch(url, { ...init, signal: controller.signal });
+  let probeTimer = null;
+  const armProbe = () => new Promise((_, reject) => {
+    probeTimer = setTimeout(() => {
+      freshQuotaProbe(token, sessionModel).catch((error) => {
+        if (error instanceof QuotaExhaustedError) {
+          try { controller.abort(error); } catch { controller.abort(); }
+          reject(error);
+        }
+      });
+    }, STREAM_NO_DATA_PROBE_DELAY_MS);
+  });
+  const clearProbe = () => {
+    if (probeTimer !== null) clearTimeout(probeTimer);
+    probeTimer = null;
+  };
+  try {
+    // 首个字节前不再使用 AbortSignal.timeout(20s)。
+    const response = await Promise.race([request, armProbe()]);
+    clearProbe();
+    if (!response.body) throw new EmptyUpstreamStreamError();
+
+    const reader = response.body.getReader();
+    const first = await Promise.race([reader.read(), armProbe()]);
+    clearProbe();
+    if (first.done) {
+      try { reader.releaseLock(); } catch {}
+      throw new EmptyUpstreamStreamError();
+    }
+
+    // 首个 chunk 已到达，交还给正常 SSE 转发逻辑；不再设置固定总时长。
+    const body = new ReadableStream({
+      start(streamController) {
+        streamController.enqueue(first.value);
+        (async () => {
+          try {
+            while (true) {
+              const next = await reader.read();
+              if (next.done) break;
+              streamController.enqueue(next.value);
+            }
+            streamController.close();
+          } catch (error) {
+            streamController.error(error);
+          } finally {
+            try { reader.releaseLock(); } catch {}
+          }
+        })();
+      },
+      cancel(reason) { return reader.cancel(reason); },
+    });
+    return new Response(body, { status: response.status, headers: response.headers });
+  } catch (error) {
+    clearProbe();
+    try { controller.abort(error); } catch { controller.abort(); }
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -402,9 +534,7 @@ async function createSession(token, sessionModel, forceCreate = false) {
         sessCache.set(token + ":" + sessionModel, s);
         return s;
       }
-      await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
-        { "x-freebuff-instance-id": cur.data.instanceId }, SESSION_TIMEOUT_MS);
-      sessCache.clear();
+      await deleteUpstreamSession(token, cur.data.instanceId);
     }
   }
 
@@ -705,10 +835,27 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         // 会让服务端以为存在第二个实例抢同一 slot。桌面版默认也不带此头（仅模拟
         // 他人才带）。因此这里不再发送 acting-user-id。
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
-        resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+        const chatInit = {
           method: "POST", headers, body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(isStream ? UPSTREAM_TIMEOUT_MS : NONSTREAM_TIMEOUT_MS),
-        });
+        };
+        try {
+          resp = isStream
+            ? await fetchStreamWithQuotaGuard(CODEBUFF_API + "/api/v1/chat/completions", chatInit, token, mc.session)
+            : await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+                ...chatInit,
+                signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+              });
+        } catch (error) {
+          // 空流只视为当前账号的同模型 session 疑似脏状态：
+          // 删除上游旧实例，重建同模型 session，再重试一次；绝不改成别的模型。
+          if (error instanceof EmptyUpstreamStreamError && attempt === 0) {
+            await deleteUpstreamSession(token, sessForChat.instanceId);
+            if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream, same-model session recovery`);
+            sessForChat = await createSession(token, mc.session, true);
+            continue;
+          }
+          throw error;
+        }
         if (resp.ok) break;
         errText = await resp.text();
         // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
@@ -718,9 +865,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           (resp.status === 409 && errText.includes("session_superseded")) ||
           (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
         if (staleSession && attempt === 0) {
-          sessCache.delete(token + ":" + mc.session);
+          await deleteUpstreamSession(token, sessForChat.instanceId);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
-          // forceCreate：跳过 GET 复用僵尸 session，直接 POST 拿全新实例
           sessForChat = await createSession(token, mc.session, true);
           continue;
         }
@@ -749,9 +895,16 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     } catch (e) {
       console.error("[" + mode + "]", e);
       const msg = String(e.message || e);
-      // 任何上游交互失败/超时（含 chat fetch 20s abort）都冷却当前号，继续换下一个号
-      // ⚠️ createSession 429（额度耗尽）按 retryAfterMs/文本冷却（luna 可达数小时），
-      // 不能固定 60s——否则冷却完又进池子反复撞 429。
+      // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
+      if (e instanceof QuotaExhaustedError) {
+        sessCache.delete(token + ":" + mc.session);
+        cooldown(token, e.retryAfterMs || 5 * 60 * 1000);
+      }
+      if (e instanceof EmptyUpstreamStreamError) {
+        cooldown(token, 60 * 1000);
+      }
+      // 其他上游交互失败/超时继续沿用原有冷却逻辑；流式 chat 不再因固定 20s abort 进入这里。
+      // createSession 429（额度耗尽）按 retryAfterMs/文本冷却，不能固定 60s。
       if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
         const m429 = msg.match(/429/);
         cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
@@ -1320,7 +1473,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.7.2" });
+  }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 
 function getApiKey(request, env) {
