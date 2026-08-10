@@ -36,6 +36,17 @@ const STANDARD_MODELS = new Set([
   "mimo/mimo-v2.5",
 ]);
 
+// ---------------------------------------------------------------------------
+// 桌面版协议常量（逆向自 Freebuff Desktop orchestrator.js）
+// 桌面版 = multi-session 模式（每 tab 一个实例），与 CLI 单会话区分。
+// ⚠️ 实测（2026-08-10）：multi-session 创建的实例 chat 报 428 waiting_room_required
+// （服务端 chat gate 不识别多会话实例），因此 POST 实际用单会话但保留
+// 预生成 instance-id 的桌面版签名。include-unused-rate-limits 是浏览器/
+// 模型选择器用的额度快照头，GET 探测时带它没问题。
+// ---------------------------------------------------------------------------
+const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "1" };
+const DESKTOP_CHAT_UA = "ai-sdk/openai-compatible/3.0.20/codebuff";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -50,7 +61,7 @@ export default {
       const unknownCount = probes.filter((p) => p.alive === null).length;
       return jsonResponse({
         status: "ok",
-        version: "1.6.7",
+        version: "1.7.0",
         accounts: acctCount,
         alive_accounts: aliveCount,
         unknown_accounts: unknownCount,
@@ -137,7 +148,7 @@ async function probeAccount(token) {
           "/api/v1/freebuff/session",
           token,
           undefined,
-          { "x-freebuff-include-unused-rate-limits": "1" },
+          DESKTOP_INCLUDE_RATE_LIMITS,
           SESSION_TIMEOUT_MS,
         );
         if (s.status === 200 && s.data && s.data.rateLimitsByModel) {
@@ -286,13 +297,8 @@ const NONSTREAM_TIMEOUT_MS = 45000; // 非流式要聚合完整上游流（含�
 const SESSION_TIMEOUT_MS = 10000;  // session/run 等短交互更快失败
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
-  const headers = {
-    "Accept": "*/*",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-    "Host": "www.codebuff.com",
-    "User-Agent": "Bun/1.3.11",
-  };
+  const headers = {};
+  // 桌面版协议：不手动设置 User-Agent（fetch 默认），只带必要的业务头
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   Object.assign(headers, extraHeaders);
@@ -327,8 +333,10 @@ async function createSession(token, sessionModel, forceCreate = false) {
   }
   // 1) 查上游当前 session，同模型直接复用（forceCreate 时跳过：僵尸 active session 会被 GET 反复复用，
   //    导致 chat 一直 428；强制 POST 拿全新实例）
+  //    桌面版签名：GET 带 include-unused-rate-limits（模型选择器额度快照头）
   if (!forceCreate) {
-    const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, undefined, SESSION_TIMEOUT_MS);
+    const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
+      DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
     if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
       const cm = cur.data.model;
       if (!cm || cm === sessionModel) {
@@ -336,7 +344,8 @@ async function createSession(token, sessionModel, forceCreate = false) {
         sessCache.set(token + ":" + sessionModel, s);
         return s;
       }
-      await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined, undefined, SESSION_TIMEOUT_MS);
+      await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
+        { "x-freebuff-instance-id": cur.data.instanceId }, SESSION_TIMEOUT_MS);
       sessCache.clear();
     }
   }
@@ -355,10 +364,13 @@ async function createSession(token, sessionModel, forceCreate = false) {
     await enqueueUp("GET", "/api/v1/freebuff/streak", token, undefined, undefined, 5000);
   } catch {}
 
-  // 2) create（可能 queue）。⚠️ 实测(2026-08-07)：x-freebuff-multi-session:1 创建的实例上游 GET 为
-  //    status:none、chat 报 428 waiting_room_required；必须不带该 header 用默认主 session 才有效
+  // 2) create（可能 queue）。桌面版签名：POST 带预生成 x-freebuff-instance-id（客户端 UUID）。
+  //    ⚠️ 实测（2026-08-10）：multi-session:1 创建的实例 chat 报 428 waiting_room_required
+  //    （服务端 chat gate 不识别多会话实例），所以这里用单会话 + 预生成 instance-id：
+  //    既保留桌面版客户端预生成实例的指纹，又确保 chat 能被识别。
+  const instId = crypto.randomUUID();
   const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
-    { "x-freebuff-model": sessionModel, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
+    { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
   if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
     const s = { model: r.data.model || sessionModel, instanceId: r.data.instanceId, remainingMs: r.data.remainingMs, expiresAt: r.data.expiresAt };
     sessCache.set(token + ":" + sessionModel, s);
@@ -623,19 +635,17 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       for (let attempt = 0; attempt < 2; attempt++) {
         const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
         const headers = {
-          Authorization: `Bearer ${token}`,
+          Authorization: "Bearer " + token,
           "Content-Type": "application/json",
           "x-freebuff-instance-id": sessForChat.instanceId,
-          "User-Agent": "ai-sdk/openai-compatible/0.0.141/codebuff",
+          "User-Agent": DESKTOP_CHAT_UA,
         };
-        // x-freebuff-acting-user-id：优先用 token 配对的 uid（"token:uid" 格式），
-        // 上游按该头独立计额（limit 6/天）——每个号配自己的 uid 才能真正多号轮换。
-        // 无配对 uid 时回退 FREEBUFF_USER_ID（跳过默认值 2027142c-...，该值会导致 4 号共享额度池）；
-        // 都没有就不带，让上游按 Authorization token 计额。
-        const acctUid = acct && acct.uid;
-        const globalUid = env.FREEBUFF_USER_ID && env.FREEBUFF_USER_ID !== "2027142c-e843-443f-b7d0-d636016d37c4" ? env.FREEBUFF_USER_ID : null;
-        const actingUid = acctUid || globalUid;
-        if (actingUid) headers["x-freebuff-acting-user-id"] = actingUid;
+        // x-freebuff-acting-user-id：⚠️ 实测（2026-08-10）不带它 chat 才能过（200），
+        // 带上反而 409 session_superseded（"Another instance of freebuff has taken over
+        // this session. Only one instance per account is allowed."）。
+        // 原因：预生成 instance-id 已把 session 绑定到 token 自身，再带 acting-user-id
+        // 会让服务端以为存在第二个实例抢同一 slot。桌面版默认也不带此头（仅模拟
+        // 他人才带）。因此这里不再发送 acting-user-id。
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
           method: "POST", headers, body: JSON.stringify(payload),
@@ -1079,7 +1089,7 @@ function handleModels() {
   return jsonResponse({
     object: "list",
     data: MODELS.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
-  }, 200, { "X-Freebuff2api-Version": "1.6.7" });
+  }, 200, { "X-Freebuff2api-Version": "1.7.0" });
 }
 
 function getApiKey(request, env) {
