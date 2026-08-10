@@ -194,10 +194,49 @@ async function main() {
     writeFileSync(outPath, JSON.stringify(payload, null, 2) + "\n");
     console.log(`✅ 生成 ${outPath}`);
     console.log(`   模型数: ${models.length}`);
-    for (const m of models) console.log(`     ${m.id} -> ${m.agent}`);
-    console.log(`   premium 池: ${payload.pools.premium.join(", ")}`);
-    console.log(`   glm 池: ${payload.pools.glm.join(", ")}`);
-    console.log(`   standard 池: ${payload.pools.standard.join(", ")}`);
+
+    // ---- 同时生成 MODELS.md（北京时间，Premium 优先） ----
+    const mdPath = join(REPO_ROOT, "MODELS.md");
+    const beijingTime = new Date().toLocaleString("sv-SE", { timeZone: "Asia/Shanghai", hour12: false }).replace(" ", " ");
+    const knownNames = {
+      "deepseek/deepseek-v4-flash":   "DeepSeek V4 Flash（推理模型，代码/数学/推理优秀）",
+      "deepseek/deepseek-v4-pro":     "DeepSeek V4 Pro（最强推理模型）",
+      "minimax/minimax-m3":           "MiniMax M3（综合能力强，中文优秀）",
+      "mimo/mimo-v2.5":               "MiMo V2.5（轻量高效，适合快速任务）",
+      "openai/gpt-5.6-luna":          "GPT-5.6 Luna（OpenAI 最新，推理顶尖）",
+      "z-ai/glm-5.2":                 "GLM 5.2（智谱 AI，推荐解锁后使用）",
+      "poolside/laguna-s-2.1":        "Laguna S 2.1（Poolside 代码专用模型）",
+      "openrouter/poolside/laguna-s-2.1": "Laguna S 2.1（OpenRouter 通道）",
+      "inclusionai/ling-3.0-flash:free": "Ling 3.0 Flash（免费模型，响应快）",
+      "crof/greg-2-ultra":            "Greg 2 Ultra（CROF 旗舰模型）",
+      "crof/greg-2-super":            "Greg 2 Super（CROF 高性能模型）",
+      "anthropic/claude-fable-5":     "Claude Fable 5（Anthropic 限量模型）",
+      "meta/muse-spark-1.2-contributor": "Muse Spark 1.2（Meta 开发者专属，限量）",
+      "crof/kimi-k3-eco":            "Kimi K3 Eco（CROF 平衡型模型）",
+    };
+    const mdLines = [
+      `# Freebuff 可用模型（${beijingTime} 北京时间）`,
+      "",
+      `> 自动生成 · 来源：[CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) main · 更新频率：每天`,
+      "",
+    ];
+    // 按 pool 分组：premium 优先，然后 standard，最后 glm
+    const sections = [
+      { title: "会员（Premium）模型", ids: [...premium].sort() },
+      { title: "标准（STANDARD）模型", ids: standard.sort() },
+      { title: "独立池（GLM 推荐解锁）", ids: [...glm].sort() },
+    ];
+    for (const sec of sections) {
+      mdLines.push(`## ${sec.title}`, "");
+      for (const id of sec.ids) {
+        const desc = knownNames[id] || id;
+        mdLines.push(`- \`${id}\` —— ${desc}`);
+      }
+      mdLines.push("");
+    }
+    mdLines.push(`---`, `共 ${models.length} 个模型 · 上次更新：${beijingTime}`, "");
+    writeFileSync(mdPath, mdLines.join("\n"));
+    console.log(`✅ 生成 ${mdPath}`);
   } catch (e) {
     console.error("❌ 解析失败:", e.message);
     process.exit(1);

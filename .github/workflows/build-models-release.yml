@@ -1,10 +1,8 @@
-name: 构建 Freebuff 模型 JSON 并发布 Release
+name: 构建 Freebuff 模型快照并更新 MODELS.md
 
-# 每天 06:00 UTC（太平洋 23:00，太平洋日额度重置 07:00 之前）自动构建，
-# 也可在 Actions 页面手动触发。
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 6 * * *"   # 每天 06:00 UTC（北京时间 14:00）
   workflow_dispatch:
 
 permissions:
@@ -23,26 +21,32 @@ jobs:
         with:
           node-version: 22
 
-      - name: 运行解析脚本（拉官方源 → 生成 freebuff-models.json）
+      - name: 运行解析脚本（生成 freebuff-models.json + MODELS.md）
         run: |
           node scripts/build-freebuff-models-json.mjs freebuff-models.json
 
-      - name: 上传产物（供下载）
-        uses: actions/upload-artifact@v4
-        with:
-          name: freebuff-models
-          path: freebuff-models.json
-          retention-days: 7
-
-      - name: 创建/更新 GitHub Release（latest 标记）
+      - name: 上传 JSON 到 Release（Worker 兜底源）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           DATE=$(date -u +%Y%m%d-%H%M%S)
-          # 删除旧的 latest release（同名则更新）
           gh release delete latest --yes --repo "${GITHUB_REPOSITORY}" 2>/dev/null || true
           gh release create "models-${DATE}" freebuff-models.json \
             --repo "${GITHUB_REPOSITORY}" \
             --title "Freebuff Models (${DATE})" \
-            --notes "动态模型映射快照。由 GitHub Actions 定时从官方 CodebuffAI/freebuff 源生成。Worker 兜底源：https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/freebuff-models.json" \
+            --notes "动态模型映射快照（北京时间 $(TZ=Asia/Shanghai date +%Y-%m-%d\ %H:%M)）" \
             --latest
+
+      - name: 提交 MODELS.md 更新到 main（保持工作流活跃，防止 60 天无活动被禁用）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add MODELS.md
+          if git diff --cached --quiet; then
+            echo "MODELS.md 无变化，跳过提交"
+          else
+            DATE=$(TZ=Asia/Shanghai date +%Y-%m-%d\ %H:%M)
+            git commit -m "docs: update MODELS.md (${DATE} 北京时间)" --no-verify
+            git push origin main
+            echo "✅ MODELS.md 已提交并推送"
+          fi
