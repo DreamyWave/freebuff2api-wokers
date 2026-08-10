@@ -519,6 +519,30 @@ def _all_tokens():
     return []
 
 
+def _format_quota(rate_limits):
+    """格式化只读 GET /session 返回的额度快照。
+
+    优先显示 Premium/Luna 等有明确 limit 的模型；如果上游只返回一个模型，
+    也照常显示。不会发起 POST，因此不创建 session、不消耗额度。
+    """
+    if not isinstance(rate_limits, dict) or not rate_limits:
+        return "额度未知（上游未返回 rateLimitsByModel）"
+    rows = []
+    for model, info in rate_limits.items():
+        if not isinstance(info, dict):
+            continue
+        rc = info.get("recentCount")
+        lim = info.get("limit")
+        if rc is None or lim is None:
+            continue
+        reset = info.get("resetAt") or info.get("reset_at")
+        text = f"{model}={rc}/{lim}"
+        if reset:
+            text += f"，reset={reset}"
+        rows.append(text)
+    return "额度 " + "；".join(rows) if rows else "额度未知（快照字段不完整）"
+
+
 def _check_one(tok):
     """测活。GET /api/v1/freebuff/session 是 0 消耗探测（不创建 session），
     一次调用同时判定：token 失效 / 被封禁 / 地区受限 / 额度用完 / 存活。
@@ -528,7 +552,11 @@ def _check_one(tok):
     - token 无效：401
     - 额度用完：429 或 status=rate_limited
     返回 (verdict, detail)。"""
-    headers = {"Authorization": f"Bearer {tok}"}
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        # 官方只读额度快照提示：不创建 session、不消耗额度。
+        "x-freebuff-include-unused-rate-limits": "1",
+    }
     status, data, _ = _http("GET", "/api/v1/freebuff/session", headers=headers,
                             timeout=REQUEST_TIMEOUT)
     if status is None:
@@ -545,10 +573,13 @@ def _check_one(tok):
                 return "地区受限 ⚠️", "HTTP 403 + status=country_blocked（当前出口 IP 非美国）"
         return "访问被拒 ⚠️", f"HTTP 403: {str(data)[:200]}"
     if status == 429:
-        return "额度用完 ⚠️", "HTTP 429（当天 session 额度已用完，等 reset）"
+        quota_str = _format_quota(data.get("rateLimitsByModel")) if isinstance(data, dict) else "额度未知（429 未返回额度快照）"
+        return "额度用完 ⚠️", f"HTTP 429（当天 session 额度已用完，等 reset），{quota_str}"
     if status == 404:
-        # 官方源码：404 = 无 session，账号正常
-        return "存活（无活跃 session）✅", "HTTP 404（无 session，账号可用，0 消耗探测正常）"
+        # 404 只代表当前没有 active session。部分上游版本会把额度快照
+        # 放在错误响应 JSON 中，若有就照常显示。
+        quota_str = _format_quota(data.get("rateLimitsByModel")) if isinstance(data, dict) else "额度未知（404 未返回额度快照）"
+        return "存活（无活跃 session）✅", f"HTTP 404（无 session，账号可用），{quota_str}"
     if not isinstance(data, dict):
         return "未知", f"HTTP {status}: {str(data)[:200]}"
     st = data.get("status")
@@ -558,24 +589,29 @@ def _check_one(tok):
     if st == "active":
         model = data.get("model", "?")
         tier = data.get("accessTier", "?")
-        # 额度快照（rateLimitsByModel 里取一个代表性的）
-        quota_str = ""
-        rlm = data.get("rateLimitsByModel")
-        if isinstance(rlm, dict) and rlm:
-            m0, info = next(iter(rlm.items()))
-            rc = info.get("recentCount")
-            lim = info.get("limit")
-            if rc is not None and lim is not None:
-                quota_str = f"，额度 {rc}/{lim}"
+        quota_str = _format_quota(data.get("rateLimitsByModel"))
+        if quota_str:
+            quota_str = "，" + quota_str
         return "存活 ✅", f"session active, model={model}, tier={tier}{quota_str}"
-    if st == "none":
-        return "存活（无活跃 session）✅", "0 消耗探测正常，账号可用"
+    if st in ("none", "ended"):
+        quota_str = _format_quota(data.get("rateLimitsByModel"))
+        if st == "ended":
+            detail = "当前 session 已结束，账号仍可用"
+            verdict = "存活（session 已结束）✅"
+        else:
+            detail = "0 消耗探测正常，账号可用"
+            verdict = "存活（无活跃 session）✅"
+        if quota_str:
+            detail += f"，{quota_str}"
+        return verdict, detail
     if st == "country_blocked":
         return "地区受限 ⚠️", "当前出口 IP 非美国（freebuff 免费模型限 US）"
     if st == "model_locked":
-        return "存活（session 被锁定）⚠️", "另一模型 session 占用中，稍后自动释放"
+        quota_str = _format_quota(data.get("rateLimitsByModel"))
+        return "存活（session 被锁定）⚠️", f"另一模型 session 占用中，稍后自动释放，{quota_str}"
     if st == "rate_limited":
-        return "额度用完 ⚠️", "当天 session 额度已用完，等 reset"
+        quota_str = _format_quota(data.get("rateLimitsByModel"))
+        return "额度用完 ⚠️", f"当天 session 额度已用完，等 reset，{quota_str}"
     if st == "ip_capped":
         return "存活（IP 并发达上限）⚠️", "当前出口 IP 活跃用户过多，稍后重试"
     return "存活 ✅", f"HTTP {status}, status={st}"
