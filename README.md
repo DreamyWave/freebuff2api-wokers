@@ -91,9 +91,22 @@ freebuff 登录凭证（authToken）通过官方 CLI 同款**授权码轮询**�
 ```bash
 cd freebuff_tools
 python3 extract_freebuff.py login   # 打印授权 URL 到终端，浏览器授权后自动轮询
-python3 extract_freebuff.py show    # 查看/验证已保存 token
+python3 extract_freebuff.py show    # 显示全部账号：邮箱 + token + 存活状态 + 汇总一行一个
 python3 extract_freebuff.py tgsend  # 测试 TG 连通性（配了 TG 时用）
 ```
+
+本地运行 `login` 时，每个账号会**分键追加**保存到 `freebuff_tools/freebuff_credentials.json`（不覆盖已有账号，支持 Google / GitHub 登录，均自动记录）。该文件已被 `.gitignore` 忽略，不会提交到 GitHub；结构参考 `freebuff_tools/freebuff_credentials.example.json`。
+
+其他实用命令：
+
+```bash
+python3 extract_freebuff.py export           # 汇总全部账号 token，一行一个，直接复制进 CF Workers 变量
+python3 extract_freebuff.py quota            # 查用量
+python3 extract_freebuff.py session          # 开/查 session
+python3 extract_freebuff.py chat "你好"      # 发一条消息测试模型 API
+```
+
+> 💡 `show` 内部用 `GET /api/v1/freebuff/session` 探测每个账号（**不创建 session、0 消耗**），一次显示全部状态：存活 + 额度 / token 失效 / 被封禁 / 地区受限 / 额度用完。官方对 banned 账号会在所有接口返回 `status: banned`。多账号时 `export` 输出的每行 token 直接粘贴到 Cloudflare Worker 变量 `FREEBUFF_TOKEN`（换行分隔）即可。
 
 ## 🛠️ 部署
 

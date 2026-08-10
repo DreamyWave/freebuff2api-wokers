@@ -4,10 +4,11 @@
 用法：
   python3 extract_freebuff.py login           # 开始登录（授权链接推 TG + 轮询拿 token）
   python3 extract_freebuff.py tgsend          # 测试 TG 连通性（发一条测试消息）
-  python3 extract_freebuff.py show            # 显示已保存的凭证（脱敏）
+  python3 extract_freebuff.py show            # 显示全部账号（邮箱+完整token+存活状态+汇总一行一个）
   python3 extract_freebuff.py session         # 测试开 session（POST）
   python3 extract_freebuff.py chat [消息]     # 发一条消息测试模型 API
   python3 extract_freebuff.py quota           # 查用量 /api/v1/usage
+  python3 extract_freebuff.py export          # 汇总全部账号 token 一行一个（复制进 CF Workers 变量）
 
 流程（与官方 CLI 一致）：
   1. 生成设备指纹 fingerprintId
@@ -138,24 +139,61 @@ def get_token():
         return tok
     if CRED_FILE.exists():
         cred = json.loads(CRED_FILE.read_text())
+        # 兼容旧格式 {"default": {...}}
         tok = cred.get("authToken")
         if not tok:
             tok = cred.get("default", {}).get("authToken")
+        if not tok:
+            # 新格式 {"accounts": {"<key>": {...}}}：取第一个账号
+            accts = cred.get("accounts") or {}
+            for u in accts.values():
+                tok = u.get("authToken")
+                if tok:
+                    break
         return tok
     return None
 
 
-def save_credentials(user: dict):
-    # 保留已有字段（可能含其他 profile），合并写入
+def _account_key(user: dict) -> str:
+    """账号唯一键：优先 id，其次 email，最后 authToken 前缀。"""
+    uid = user.get("id") or ""
+    email = user.get("email") or ""
+    if uid:
+        return str(uid)
+    if email:
+        return str(email)
+    tok = user.get("authToken") or ""
+    return f"token-{tok[:12]}" if tok else "unknown"
+
+
+def save_credentials(user: dict, append: bool = True):
+    """保存凭证。append=True 时按账号分键追加（不覆盖其他账号）；
+    append=False 时写为 default（兼容旧格式，CI 用）。"""
     existing = {}
     if CRED_FILE.exists():
         try:
             existing = json.loads(CRED_FILE.read_text())
         except Exception:
             pass
-    existing["default"] = user
+    if append:
+        # 新格式：accounts 分键，保留已有账号
+        accts = existing.get("accounts")
+        if not isinstance(accts, dict):
+            accts = {}
+            # 迁移旧格式 default → accounts
+            if isinstance(existing.get("default"), dict):
+                accts[_account_key(existing["default"])] = existing["default"]
+            existing = {"accounts": accts}
+        key = _account_key(user)
+        accts[key] = user
+        existing["accounts"] = accts
+    else:
+        # 旧格式：直接覆盖 default（CI 单账号场景）
+        existing["default"] = user
     CRED_FILE.write_text(json.dumps(existing, indent=2, ensure_ascii=False))
-    print(f"💾 凭证已保存 → {CRED_FILE}")
+    accts = existing.get("accounts")
+    acct_count = len(accts) if isinstance(accts, dict) else (1 if existing.get("default") else 0)
+    print(f"💾 凭证已保存 → {CRED_FILE}（当前 {acct_count} 个账号）")
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +300,8 @@ def cmd_login(args):
             mask_value(str(user.get("id", "")))
             print(f"✅ 登录成功! 账号: {email}")
 
-            save_credentials(user)
+            # 本地运行：分账号追加（不覆盖已有账号）；CI 运行：覆盖 default
+            save_credentials(user, append=not in_ci())
 
             # 关键安全点：CI + 配置了 TG 时，authToken 只推 TG，绝不打印到日志
             auth_token = user["authToken"]
@@ -300,24 +339,23 @@ def cmd_login(args):
 
 
 def cmd_show(_args):
-    tok = get_token()
-    if not tok:
+    """显示全部账号：邮箱 + token（完整显示，本地工具无需脱敏）+ 存活状态（0 消耗 GET /session），末尾汇总一行一个。"""
+    pairs = _all_tokens()
+    if not pairs:
         print("❌ 未找到 authToken（先运行 login 或设置 FREEBUFF_TOKEN）")
         sys.exit(1)
-    if CRED_FILE.exists():
-        cred = json.loads(CRED_FILE.read_text())
-        user = cred.get("default", {})
-        print("📋 已保存凭证:")
-        for k, v in user.items():
-            if k == "authToken":
-                print(f"   authToken: {v[:24]}...{v[-6:]}（长度 {len(v)}）")
-            else:
-                print(f"   {k}: {v}")
-    print(f"\n🔑 token: {tok[:24]}...{tok[-6:]}（长度 {len(tok)}）")
-    # 顺带验证
-    status, data, _ = _http("GET", "/api/v1/freebuff/session",
-                            headers={"Authorization": f"Bearer {tok}"})
-    print(f"🔍 验证 GET /session → HTTP {status}: {str(data)[:200]}")
+    print(f"📋 已保存凭证（{len(pairs)} 个账号）:")
+    print("-" * 60)
+    for _key, at, email in pairs:
+        verdict, detail = _check_one(at)
+        print(f"  [{email}] {verdict}")
+        print(f"      {at}")
+        print(f"      {detail}")
+    print("-" * 60)
+    print("\n📋 汇总（一行一个，复制进 CF Worker 变量 FREEBUFF_TOKEN）:")
+    for _key, at, _email in pairs:
+        print(f"   {at}")
+    return 0
 
 
 def cmd_session(args):
@@ -461,6 +499,104 @@ def cmd_quota(_args):
     print(json.dumps(data, indent=2, ensure_ascii=False) if data else "(空响应)")
 
 
+def _all_tokens():
+    """返回 [(key, token, email)]：优先读取 credentials.json 里的全部账号；未配置则用环境变量。"""
+    tok = os.environ.get("FREEBUFF_TOKEN")
+    if tok:
+        return [("env", tok, "环境变量")]
+    if CRED_FILE.exists():
+        try:
+            cred = json.loads(CRED_FILE.read_text())
+        except Exception:
+            cred = {}
+        accts = cred.get("accounts")
+        if isinstance(accts, dict) and accts:
+            return [(k, u.get("authToken", ""), u.get("email", "?")) for k, u in accts.items() if u.get("authToken")]
+        if isinstance(cred.get("default"), dict) and cred["default"].get("authToken"):
+            return [("default", cred["default"]["authToken"], cred["default"].get("email", "?"))]
+        if cred.get("authToken"):
+            return [("default", cred["authToken"], cred.get("email", "?"))]
+    return []
+
+
+def _check_one(tok):
+    """测活。GET /api/v1/freebuff/session 是 0 消耗探测（不创建 session），
+    一次调用同时判定：token 失效 / 被封禁 / 地区受限 / 额度用完 / 存活。
+    官方源码 freebuff-session-api.ts 判定：
+    - 正常账号：200（有 session）或 404（无 session）
+    - 被封账号：403 + {"status":"banned"}（Terminal，不可恢复）
+    - token 无效：401
+    - 额度用完：429 或 status=rate_limited
+    返回 (verdict, detail)。"""
+    headers = {"Authorization": f"Bearer {tok}"}
+    status, data, _ = _http("GET", "/api/v1/freebuff/session", headers=headers,
+                            timeout=REQUEST_TIMEOUT)
+    if status is None:
+        return "网络错误", f"请求失败: {data.get('error') if isinstance(data, dict) else data}"
+    if status == 401:
+        return "token 失效 ❌", "HTTP 401（authToken 无效或已被撤销，不是封号）"
+    if status == 403:
+        # 403 + banned = 封号；403 + country_blocked = 地区受限；其他 403 也提示
+        if isinstance(data, dict):
+            st = data.get("status")
+            if st == "banned":
+                return "已被封禁 ❌", "HTTP 403 + status=banned（官方语义：Terminal，账号不可恢复，可邮件 support@codebuff.com 申诉）"
+            if st == "country_blocked":
+                return "地区受限 ⚠️", "HTTP 403 + status=country_blocked（当前出口 IP 非美国）"
+        return "访问被拒 ⚠️", f"HTTP 403: {str(data)[:200]}"
+    if status == 429:
+        return "额度用完 ⚠️", "HTTP 429（当天 session 额度已用完，等 reset）"
+    if status == 404:
+        # 官方源码：404 = 无 session，账号正常
+        return "存活（无活跃 session）✅", "HTTP 404（无 session，账号可用，0 消耗探测正常）"
+    if not isinstance(data, dict):
+        return "未知", f"HTTP {status}: {str(data)[:200]}"
+    st = data.get("status")
+    if st == "banned":
+        return "已被封禁 ❌", "官方语义：Terminal，账号不可恢复（可邮件 support@codebuff.com 申诉）"
+    # 测活：解析存活状态 + 额度
+    if st == "active":
+        model = data.get("model", "?")
+        tier = data.get("accessTier", "?")
+        # 额度快照（rateLimitsByModel 里取一个代表性的）
+        quota_str = ""
+        rlm = data.get("rateLimitsByModel")
+        if isinstance(rlm, dict) and rlm:
+            m0, info = next(iter(rlm.items()))
+            rc = info.get("recentCount")
+            lim = info.get("limit")
+            if rc is not None and lim is not None:
+                quota_str = f"，额度 {rc}/{lim}"
+        return "存活 ✅", f"session active, model={model}, tier={tier}{quota_str}"
+    if st == "none":
+        return "存活（无活跃 session）✅", "0 消耗探测正常，账号可用"
+    if st == "country_blocked":
+        return "地区受限 ⚠️", "当前出口 IP 非美国（freebuff 免费模型限 US）"
+    if st == "model_locked":
+        return "存活（session 被锁定）⚠️", "另一模型 session 占用中，稍后自动释放"
+    if st == "rate_limited":
+        return "额度用完 ⚠️", "当天 session 额度已用完，等 reset"
+    if st == "ip_capped":
+        return "存活（IP 并发达上限）⚠️", "当前出口 IP 活跃用户过多，稍后重试"
+    return "存活 ✅", f"HTTP {status}, status={st}"
+
+
+def cmd_export(_args):
+    """汇总全部账号的 FREEBUFF_TOKEN，一行一个，方便复制进 CF Workers 变量。"""
+    pairs = _all_tokens()
+    if not pairs:
+        print("❌ 未找到 authToken（先运行 login 或设置 FREEBUFF_TOKEN）")
+        sys.exit(1)
+    print("# freebuff2api CF Workers 变量 FREEBUFF_TOKEN（一行一个账号）")
+    print("# 共 %d 个账号，复制下面的行到 Cloudflare → 变量 → FREEBUFF_TOKEN" % len(pairs))
+    print("# 注意：本输出含敏感 token，请勿泄露/提交到 git")
+    print("=" * 60)
+    for _key, tok, _email in pairs:
+        print(tok)
+    print("=" * 60)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 
 def main():
@@ -486,6 +622,8 @@ def main():
 
     sub.add_parser("quota", help="查用量")
 
+    sub.add_parser("export", help="汇总全部账号 token，一行一个，复制进 CF Workers 变量")
+
     args = p.parse_args()
     {
         "login": cmd_login,
@@ -494,6 +632,7 @@ def main():
         "chat": cmd_chat,
         "quota": cmd_quota,
         "tgsend": cmd_tgsend,
+        "export": cmd_export,
     }[args.cmd](args)
 
 
