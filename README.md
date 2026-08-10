@@ -16,8 +16,28 @@
 - 💡 **优先复用活跃 session**：一个 session 约 1 小时有效，创建 session 才扣额度；只要当前模型的 session 还活跃就钉在同一账号上，用满再换，最大化额度利用率
 - 📢 **广告与 streak 流程兼容**：创建新 session 前，Worker 会按官方客户端流程请求广告，并调用 `GET /api/v1/freebuff/streak` 尝试签到；相关请求失败会静默跳过，不阻塞聊天
 - 🧩 **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`（流式/非流式视接口支持情况而定）
+- 📨 **Anthropic Messages API**：支持 `/v1/messages`、`/messages` 及对应的 `count_tokens` 路由，可供 Anthropic SDK / 兼容客户端尝试接入
 - ❤️ **健康检查**：`GET /healthz`（免鉴权），方便监控探活
 - 📦 **单文件部署**：无依赖，CF 控制台粘贴即用
+
+## 📨 Anthropic Messages API 支持
+
+主代码已加入 Anthropic Messages API 适配，当前支持：
+
+- `POST /v1/messages`
+- `POST /messages`
+- `POST /v1/messages/count_tokens`
+- `POST /messages/count_tokens`
+- Anthropic 消息格式转换为 Worker 内部使用的 OpenAI-compatible 请求
+- 文本消息、`tool_use` / `tool_result`、`tool_choice`
+- 非流式响应和 Anthropic SSE 流式响应
+- Anthropic 风格的错误响应
+
+> ⚠️ **测试说明**：当前项目维护者没有实际使用 Anthropic Messages API 的客户端环境，因此暂未完成真实 Anthropic 客户端的端到端测试。主代码和本地 stub / 回归测试已经处理并验证转换逻辑，但不代表所有 Anthropic SDK、工具调用组合和客户端行为都已覆盖。
+>
+> 如果你有 Anthropic Messages API 的实际使用场景，欢迎在不影响现有 OpenAI API 线路的前提下进行测试，并反馈请求格式、流式响应、工具调用或模型兼容性问题。反馈时请尽量附上脱敏后的请求结构、响应状态码和错误信息。
+>
+> Anthropic API 是新增的协议适配层，不改变现有 OpenAI `/v1/chat/completions`、`/v1/responses`、账号轮换、session 生命周期和 Freebuff 主调用链。
 
 ## ⭐ 特殊模型：DeepSeek V4 Flash 与 MiMo 2.5
 
