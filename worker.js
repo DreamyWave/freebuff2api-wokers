@@ -1,7 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.5";
+const VERSION = "1.8.8";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
@@ -371,7 +371,7 @@ const STANDARD_MODELS = new Set([
 // 模型选择器用的额度快照头，GET 探测时带它没问题。
 // ---------------------------------------------------------------------------
 const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "1" };
-const DESKTOP_CHAT_UA = "ai-sdk/openai-compatible/3.0.20/codebuff";
+
 
 export default {
   async fetch(request, env) {
@@ -380,30 +380,14 @@ export default {
 
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
-      const acctCount = parseAccounts(env).length;
-      // v1.6.0：探测全部账号（GET /api/v1/freebuff/session，0 消耗），返回存活数
-      const probes = await probeAllAccounts(env);
-      const aliveCount = probes.filter((p) => p.alive === true).length;
-      const unknownCount = probes.filter((p) => p.alive === null).length;
-      // v1.7.2：按 state 分组统计（区分额度用完 vs 封控）
-      const stateCount = {};
-      for (const p of probes) {
-        const s = p.state || "unknown";
-        stateCount[s] = (stateCount[s] || 0) + 1;
-      }
+      // 健康检查只读 Worker 最近一次真实请求形成的本地快照。
+      // 不因为公开探针访问就向上游 fan-out GET /session 和 /me；这类请求
+      // 会产生额外行为，也可能干扰同一账号正在进行的会话。
       return jsonResponse({
         status: "ok",
         version: VERSION,
-        accounts: acctCount,
-        alive_accounts: aliveCount,
-        unknown_accounts: unknownCount,
-        account_states: stateCount, // { ok: n, banned: n, rate_limited: n, ... }
-        account_details: probes.map((p) => ({
-          token: p.token.slice(0, 8) + "...",
-          alive: p.alive,
-          state: p.state, // ok / banned / rate_limited / token_invalid / country_blocked / blocked / model_locked / ip_capped / unknown
-          uid: p.uid ? p.uid.slice(0, 8) + "..." : null, // 脱敏：uid 也是敏感账号 id，不完整暴露
-        })),
+        ...summarizeAccountHealth(parseAccounts(env), acctHealth),
+        health_source: "worker_cache",
         time: new Date().toISOString(),
       }, 200);
     }
@@ -445,6 +429,7 @@ let accountIdx = 0;
 const cooldowns = new Map();      // token -> 冷却到期 ms
 const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt }（必须带 token，多账号防串号）
 
+
 function parseAccounts(env) {
   // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
   // 例："t1\nt2:u2\nt3,u4:u4" → [{token:t1,uid:null},{token:t2,uid:u2},...]
@@ -463,90 +448,75 @@ function parseAccounts(env) {
 // 账号健康探测（v1.6.0）：GET /api/v1/me 不消耗 session/额度，探测 token 有效性并自动发现 uid
 // ---------------------------------------------------------------------------
 
-const acctHealth = new Map(); // token -> { alive, uid, checkedAt }
-const PROBE_TTL_MS = 10 * 60 * 1000; // 探测结果缓存 10 分钟，避免每次请求都打上游
+const acctHealth = new Map(); // token -> { alive, state, uid, quota, checkedAt }
+const HEALTH_OBSERVATION_TTL_MS = 10 * 60 * 1000;
 
-/**
- * 探测单个账号：GET /api/v1/me（0 消耗，不建 session）
- * - 200 → { alive: true, uid: data.id }（uid = 真实账号 id，自动发现）
- * - 401 → { alive: false }（token 失效）
- * - 其他/网络错误 → 不判定失效（返回 null 由调用方决定是否信任缓存）
- * 
- * 额外：GET /api/v1/freebuff/session 拿 rateLimitsByModel → quota（recentCount/limit），
- * 供 pickToken 按剩余额度选号（v1.6.2）。GET 不建 session，0 消耗。
- * 服务端可能默认返回 compact 响应；显式请求完整额度快照，避免 quota 探测退化。
- */
-async function probeAccount(token, forceRefresh = false) {
-  const cached = acctHealth.get(token);
-  if (!forceRefresh && cached && Date.now() - cached.checkedAt < PROBE_TTL_MS) return cached;
-  try {
-    // v1.7.2：改用 GET /freebuff/session 探测状态（0 消耗），
-    // 官方源码 freebuff-session-api.ts 判定：
-    //   200 + status:active/none        → 正常
-    //   404                            → 无 session，账号正常
-    //   403 + status:banned            → 封控（Terminal，不可恢复）
-    //   403 + status:country_blocked   → 地区受限
-    //   401                            → token 失效
-    //   429 + status:rate_limited      → 额度用完（当天 session 数用尽）
-    const r = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
-      DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
-    let state = "unknown", uid = null, quota = null;
-    if (r.status === 200 && r.data && typeof r.data === "object") {
-      const st = r.data.status;
-      if (st === "banned") state = "banned";
-      else if (st === "country_blocked") state = "country_blocked";
-      else if (st === "rate_limited") state = "rate_limited";
-      else if (st === "model_locked") state = "model_locked";
-      else if (st === "ip_capped") state = "ip_capped";
-      else state = "ok"; // active / none / ended 都算可用
-      if (r.data.rateLimitsByModel) quota = r.data.rateLimitsByModel;
-      // session 接口不返回 uid，需要时再补 /me（不阻塞主探测）
-      if (state === "ok") {
-        try {
-          const m = await enqueueUp("GET", "/api/v1/me", token, undefined, undefined, SESSION_TIMEOUT_MS);
-          if (m.status === 200 && m.data && typeof m.data.id === "string") uid = m.data.id;
-        } catch {}
-      }
-    } else if (r.status === 404) {
-      state = "ok"; // 无 session，账号正常
-    } else if (r.status === 401) {
-      state = "token_invalid";
-    } else if (r.status === 403) {
-      // 403 但 body 里没有可识别 status：区分 401 之外的拒绝
-      const st = r.data && typeof r.data === "object" ? r.data.status : null;
-      state = st === "banned" ? "banned" : (st === "country_blocked" ? "country_blocked" : "blocked");
-    } else if (r.status === 429) {
-      state = "rate_limited";
-    }
-    const info = {
-      alive: state === "ok",
-      state,
-      uid,
-      quota,
-      retryAfterMs: r.data && typeof r.data.retryAfterMs === "number" ? r.data.retryAfterMs : null,
-      checkedAt: Date.now(),
-    };
-    acctHealth.set(token, info);
-    return info;
-  } catch {
-    return null;
+// 只记录真实业务请求已经观察到的上游结果。不要在 healthz 中主动探测，
+// 也不要把网络错误/未知响应误记成账号失效。
+function recordAccountObservation(token, status, dataOrText, extra = {}) {
+  if (!token) return;
+  let data = dataOrText;
+  if (typeof dataOrText === "string") {
+    try { data = JSON.parse(dataOrText); } catch { data = null; }
   }
+  const upstreamState = data && typeof data === "object" ? data.status || data.state : null;
+  let state = null;
+  if (status === 404) state = "ok";
+  else if (["banned", "country_blocked", "rate_limited", "model_locked", "ip_capped"].includes(upstreamState)) state = upstreamState;
+  else if (status >= 200 && status < 300) state = "ok";
+  else if (status === 401) state = "token_invalid";
+  else if (status === 403) {
+    state = upstreamState === "banned"
+      ? "banned"
+      : upstreamState === "country_blocked" ? "country_blocked" : "blocked";
+  } else if (status === 429) state = "rate_limited";
+  if (!state) return;
+
+  const previous = acctHealth.get(token) || {};
+  acctHealth.set(token, {
+    ...previous,
+    ...extra,
+    alive: state === "ok",
+    state,
+    uid: extra.uid || previous.uid || null,
+    quota: extra.quota || previous.quota || null,
+    retryAfterMs: typeof extra.retryAfterMs === "number" ? extra.retryAfterMs : previous.retryAfterMs || null,
+    checkedAt: Date.now(),
+  });
 }
 
-/** 探测全部账号并返回汇总（healthz 用） */
-async function probeAllAccounts(env) {
-  const pool = parseAccounts(env);
-  const results = [];
-  for (const acct of pool) {
-    const info = await probeAccount(acct.token);
-    results.push({
-      token: acct.token,
+function summarizeAccountHealth(pool, health) {
+  const account_details = pool.map((acct) => {
+    const info = health.get(acct.token);
+    return {
+      token: acct.token.slice(0, 8) + "...",
       alive: info ? info.alive : null,
-      state: info ? info.state : null,
-      uid: info ? info.uid : null,
-    });
+      state: info?.state || "unknown",
+      uid: info?.uid ? info.uid.slice(0, 8) + "..." : null,
+    };
+  });
+  const account_states = {};
+  for (const detail of account_details) {
+    account_states[detail.state] = (account_states[detail.state] || 0) + 1;
   }
-  return results;
+  const alive_accounts = account_details.filter((p) => p.alive === true).length;
+  const unknown_accounts = account_details.filter((p) => p.alive === null).length;
+  const unhealthy_accounts = account_details.filter((p) => p.alive === false).length;
+  const status = pool.length === 0
+    ? "critical"
+    : alive_accounts === 0 && (unhealthy_accounts > 0 || unknown_accounts > 0)
+      ? "critical"
+      : unhealthy_accounts > 0 || unknown_accounts > 0
+        ? "degraded"
+        : "ok";
+  return {
+    status,
+    accounts: pool.length,
+    alive_accounts,
+    unknown_accounts,
+    account_states,
+    account_details,
+  };
 }
 
 function pickToken(env, sessionModel) {
@@ -560,22 +530,11 @@ function pickToken(env, sessionModel) {
   });
   const usePool = alivePool.length > 0 ? alivePool : pool; // 全失效时回退全池，让请求继续（由 429 冷却接管）
 
-  // v1.6.7：按用户请求的模型所属额度池选择账号；额度判断只影响账号，
-  // 永远不替换用户请求的模型。Premium 四模型共享一个池；Flash/MiMo
-  // 是普通模型，不借用 Premium 快照。
-  const quotaSorted = [...usePool].sort((a, b) => {
-    const ra = remainingQuota(a.token, sessionModel);
-    const rb = remainingQuota(b.token, sessionModel);
-    if (ra === null && rb === null) return 0;
-    if (ra === null) return 1;  // 无数据排后面（保底）
-    if (rb === null) return -1;
-    return rb - ra;  // 剩余多的优先
-  });
-  const withQuota = quotaSorted.filter((a) => {
-    const r = remainingQuota(a.token, sessionModel);
-    return r !== null && r > 0;
-  });
-  const finalPool = withQuota.length > 0 ? withQuota : quotaSorted; // 全部耗尽时回退排序池（仍有额度概念）
+  // v1.8.5.1：账号选择恢复为稳定轮询。
+  // rateLimitsByModel 仅作为观测数据，不参与轮询顺序；真实 session/chat
+  // 返回明确限流后，再通过 cooldown 跳过该账号。这样不会因为旧快照
+  // 抢占轮询，也不会把账号顺序重排成“剩余额度最多优先”。
+  const finalPool = usePool;
 
   // 优先复用已有活跃 session 缓存的号：一个 session 约 1 小时有效，创建 session 才扣
   // 免费额度（如 v4-pro 每天 6 次）。纯轮询会让每个请求都切号、各建一个 session，
@@ -585,7 +544,7 @@ function pickToken(env, sessionModel) {
       const t = acct.token;
       if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
       const cached = sessCache.get(t + ":" + sessionModel);
-      if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now() + 60000) {
+      if (isUsableSession(cached)) {
         return acct;
       }
     }
@@ -600,30 +559,75 @@ function pickToken(env, sessionModel) {
   }
   const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
   if (oldest) cooldowns.delete(oldest[0]);
-  return pool[0];
+  return finalPool[0];
+}
+
+function normalizeSession(data, requestedModel, now = Date.now()) {
+  const expiryMs = Date.parse(data?.expiresAt || "");
+  const remaining = Number(data?.remainingMs);
+  const effectiveExpiry = Number.isFinite(expiryMs)
+    ? expiryMs
+    : (Number.isFinite(remaining) ? now + Math.max(0, remaining) : NaN);
+  return {
+    model: data?.model || requestedModel,
+    instanceId: data?.instanceId || null,
+    remainingMs: Number.isFinite(effectiveExpiry) ? Math.max(0, effectiveExpiry - now) : null,
+    expiresAt: Number.isFinite(effectiveExpiry) ? new Date(effectiveExpiry).toISOString() : null,
+  };
+}
+
+function isUsableSession(session, now = Date.now()) {
+  const expiryMs = Date.parse(session?.expiresAt || "");
+  return Boolean(session?.instanceId) && Number.isFinite(expiryMs) && expiryMs > now + 60000;
+}
+
+function accountSlot(pool, token) {
+  const index = pool.findIndex((acct) => acct.token === token);
+  return index >= 0 ? `${index + 1}/${pool.length}` : `?/${pool.length}`;
+}
+
+function logAccountRoute(enabled, pool, token, model, attempt, reason) {
+  if (!enabled) return;
+  try {
+    console.log(JSON.stringify({ event: "account_route", model, account_slot: accountSlot(pool, token), attempt, reason }));
+  } catch {}
 }
 
 function cooldown(token, ms) {
   if (ms > 0) cooldowns.set(token, Date.now() + ms);
 }
 
-/**
- * 计算某 token 某模型的剩余额度（limit - recentCount）。
- * - 无 quota 数据 → null（不参与额度排序，保底）
- * - Premium 模型缺少自身字段 → 仅使用同一 Premium 池内其他模型的快照
- * - Standard 模型不读取 Premium 快照；其额度由实际 session 响应判断
- * - 剩余 <= 0 → 该号额度耗尽（跳过）
- */
+// Official Freebuff session-gate recovery requires matching both the HTTP
+// status and the relayed error code. Do not treat session_limit_reached or
+// waiting_room_queued as stale sessions: those states must not delete a live
+// session or burn another session slot.
+const SESSION_GATE_RECOVERY = {
+  waiting_room_required: 428,
+  session_expired: 410,
+  session_superseded: 409,
+  session_model_mismatch: 409,
+};
+
+function hasExactErrorCode(value, expected) {
+  if (value === expected) return true;
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some((entry) => hasExactErrorCode(entry, expected));
+}
+
+function isStaleSessionGate(status, body) {
+  let parsed = null;
+  try { parsed = JSON.parse(body); } catch {}
+  return Object.entries(SESSION_GATE_RECOVERY).some(([code, expectedStatus]) =>
+    status === expectedStatus && hasExactErrorCode(parsed, code));
+}
+
+// 仅供流式无首数据时确认 Premium 额度是否耗尽；不参与账号轮询排序。
 function remainingQuota(token, sessionModel) {
-  // STANDARD 的 rateLimitsByModel 目前不是可靠的剩余次数 oracle；
-  // 不用它跳过账号，交给真实 session/chat 响应决定是否切号。
   if (modelPoolCategory(sessionModel) === "standard") return null;
   const h = acctHealth.get(token);
   if (!h || !h.quota) return null;
   let entry = h.quota[sessionModel];
   if (!entry && modelPoolCategory(sessionModel) === "premium") {
-    // 只在同一个 Premium 共享池内寻找代表性快照，绝不跨到
-    // Flash/MiMo 或其他模型；这只是额度池判断，不会改变请求模型。
     const premiumPool = (dynamicModelsCache.pool && dynamicModelsCache.pool.premium)
       ? dynamicModelsCache.pool.premium
       : PREMIUM_QUOTA_MODELS;
@@ -759,7 +763,7 @@ function enqueueUp(method, path, token, body, extraHeaders, timeoutMs) {
 async function freshQuotaProbe(token, sessionModel) {
   const cached = acctHealth.get(token);
   if (!cached) return;
-  if (Date.now() - cached.checkedAt > PROBE_TTL_MS) return;
+  if (Date.now() - cached.checkedAt > HEALTH_OBSERVATION_TTL_MS) return;
   if (isQuotaExhausted(cached, sessionModel)) throw new QuotaExhaustedError(cached);
 }
 
@@ -834,9 +838,10 @@ async function createSession(token, sessionModel, forceCreate = false) {
   // 0) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   if (!forceCreate) {
     const cached = sessCache.get(token + ":" + sessionModel);
-    if (cached && cached.expiresAt && new Date(cached.expiresAt).getTime() > Date.now() + 60000) {
+    if (isUsableSession(cached)) {
       return cached;
     }
+    if (cached) sessCache.delete(token + ":" + sessionModel);
   }
   // 1) 查上游当前 session，同模型直接复用（forceCreate 时跳过：僵尸 active session 会被 GET 反复复用，
   //    导致 chat 一直 428；强制 POST 拿全新实例）
@@ -844,10 +849,15 @@ async function createSession(token, sessionModel, forceCreate = false) {
   if (!forceCreate) {
     const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
       DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
+    recordAccountObservation(token, cur.status, cur.data, {
+      quota: cur.data?.rateLimitsByModel || null,
+      uid: cur.data?.uid || null,
+      retryAfterMs: cur.data?.retryAfterMs,
+    });
     if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
       const cm = cur.data.model;
       if (!cm || cm === sessionModel) {
-        const s = { model: cm || sessionModel, instanceId: cur.data.instanceId, remainingMs: cur.data.remainingMs, expiresAt: cur.data.expiresAt };
+        const s = normalizeSession(cur.data, sessionModel);
         sessCache.set(token + ":" + sessionModel, s);
         return s;
       }
@@ -855,19 +865,6 @@ async function createSession(token, sessionModel, forceCreate = false) {
     }
   }
 
-  // ad) 刷广告 + streak 签到：还原官方 CLI 行为，在创建 session 前上报广告曝光 + 签到。
-  //      官方流程（参考 XxxXTeam/freebuff2api codebuff.py _request_ads_and_streak）：
-  //      广告曝光后调 GET /api/v1/freebuff/streak 签到，连续使用可获 streak 额度加成
-  //      （limit = base + referral + streak）。失败静默、超时 5s，完全不影响聊天。
-  try {
-    await enqueueUp("POST", "/api/v1/ads", token,
-      { provider: "gravity", sessionId: crypto.randomUUID(), surface: "waiting_room",
-        device: { os: "windows", timezone: "Asia/Shanghai", locale: "zh-CN" },
-        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" },
-      { "Content-Type": "application/json" }, 5000);
-    // streak 签到（v1.6.3）：GET /api/v1/freebuff/streak，0 消耗，连续使用加额度
-    await enqueueUp("GET", "/api/v1/freebuff/streak", token, undefined, undefined, 5000);
-  } catch {}
 
   // 2) create（可能 queue）。桌面版签名：POST 带预生成 x-freebuff-instance-id（客户端 UUID）。
   //    ⚠️ 实测（2026-08-10）：multi-session:1 创建的实例 chat 报 428 waiting_room_required
@@ -876,8 +873,13 @@ async function createSession(token, sessionModel, forceCreate = false) {
   const instId = crypto.randomUUID();
   const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
     { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
+  recordAccountObservation(token, r.status, r.data, {
+    quota: r.data?.rateLimitsByModel || null,
+    uid: r.data?.uid || null,
+    retryAfterMs: r.data?.retryAfterMs,
+  });
   if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
-    const s = { model: r.data.model || sessionModel, instanceId: r.data.instanceId, remainingMs: r.data.remainingMs, expiresAt: r.data.expiresAt };
+    const s = normalizeSession(r.data, sessionModel);
     sessCache.set(token + ":" + sessionModel, s);
     return s;
   }
@@ -886,8 +888,13 @@ async function createSession(token, sessionModel, forceCreate = false) {
     for (let i = 0; i < 8; i++) {
       await sleep(1500);
       const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
+      recordAccountObservation(token, q.status, q.data, {
+        quota: q.data?.rateLimitsByModel || null,
+        uid: q.data?.uid || null,
+        retryAfterMs: q.data?.retryAfterMs,
+      });
       if (q.status === 200 && q.data?.status === "active") {
-        const s = { model: q.data.model || sessionModel, instanceId: inst, remainingMs: q.data.remainingMs, expiresAt: q.data.expiresAt };
+        const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
         sessCache.set(token + ":" + sessionModel, s);
         return s;
       }
@@ -992,11 +999,10 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   payload.stream = true;
   if (!payload.stop) payload.stop = ['"cb_easp"'];
   payload.provider = { data_collection: "deny" };
-  // v1.6.4：外来客户端检测绕过。服务端 detectForeignFreebuffClient 对「带 tools 但无官方
-  // 专属工具名」的请求判定 foreign_toolset，降级到 ling-3.0-tiny:free（占免费额度→429）。
-  // 实测（2026-08-09）：tools 里混入官方专属名（end_turn，TOOLS_WHICH_WONT_FORCE_NEXT_STEP
-  // 中的无害工具）即通过检测，请求用真模型正常返回。end_turn 不会被模型实际调用
-  // （官方定义为「不强制下一步」的工具），只用于通过工具集合签名校验。
+  // 工具集签名：Freebuff 对「带 tools 但无官方专属工具名」的请求会判定为
+  // foreign_toolset 并拒绝/降级模型（表现为工具调用被限制）。end_turn 是官方
+  // TOOLS_WHICH_WONT_FORCE_NEXT_STEP 白名单里的无害工具，混入它能让带工具的
+  // 请求通过校验；end_turn 不会被模型实际调用，只用于工具集合签名。
   if (Array.isArray(payload.tools) && payload.tools.length > 0) {
     const hasSignature = payload.tools.some(
       (t) => t && typeof t === "object" && t.function && typeof t.function.name === "string" && t.function.name === "end_turn",
@@ -1012,7 +1018,6 @@ function buildUpstreamPayload(params, mc, sess, runId) {
     freebuff_instance_id: sess.instanceId,
     trace_session_id: crypto.randomUUID(),
     run_id: runId,
-    client_id: "wf-" + Math.random().toString(36).slice(2, 10),
     cost_mode: "free",
   };
   return payload;
@@ -1219,6 +1224,8 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
+    logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
+      isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     let rootRunId = null;
     let reviewerRunId = null;
     try {
@@ -1234,7 +1241,6 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         Authorization: "Bearer " + token,
         "Content-Type": "application/json",
         "x-freebuff-instance-id": sess.instanceId,
-        "User-Agent": DESKTOP_CHAT_UA,
       };
       const resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
         method: "POST",
@@ -1244,6 +1250,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       });
       if (!resp.ok) {
         const text = await resp.text();
+        recordAccountObservation(token, resp.status, text);
         lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
         cooldown(token, parseCooldown(text, resp.status));
         throw new Error(lastErrMsg);
@@ -1297,6 +1304,8 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
+    logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
+      isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     try {
       // 1) session
       const sess = await createSession(token, mc.session);
@@ -1315,7 +1324,6 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           Authorization: "Bearer " + token,
           "Content-Type": "application/json",
           "x-freebuff-instance-id": sessForChat.instanceId,
-          "User-Agent": DESKTOP_CHAT_UA,
         };
         // x-freebuff-acting-user-id：⚠️ 实测（2026-08-10）不带它 chat 才能过（200），
         // 带上反而 409 session_superseded（"Another instance of freebuff has taken over
@@ -1345,13 +1353,17 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
           }
           throw error;
         }
-        if (resp.ok) break;
+        if (resp.ok) {
+          recordAccountObservation(token, resp.status, null);
+          break;
+        }
         errText = await resp.text();
+        recordAccountObservation(token, resp.status, errText);
         // 428 waiting_room_required（无活跃 session）/ 409 session_superseded（被新 session 顶替）
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
         const staleSession =
-          (resp.status === 428 && errText.includes("waiting_room_required")) ||
-          (resp.status === 409 && errText.includes("session_superseded")) ||
+          isStaleSessionGate(resp.status, errText) ||
+          // Older upstream wrappers returned model mismatch as HTTP 502.
           (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
         if (staleSession && attempt === 0) {
           await deleteUpstreamSession(token, sessForChat.instanceId);

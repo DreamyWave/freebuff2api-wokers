@@ -229,7 +229,7 @@ async function main() {
     const mdLines = [
       `# Freebuff 可用模型（${beijingTime} 北京时间）`,
       "",
-      `> 自动生成 · 来源：[CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) main · 更新频率：每天`,
+      `> 自动生成 · 来源：[CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) main · 更新频率：每 6 小时`,
       "",
     ];
     // 按 pool 分组：premium 优先，然后 standard，最后 glm

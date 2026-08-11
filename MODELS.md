@@ -1,6 +1,6 @@
 # Freebuff 可用模型（2026-08-11 15:27:47 北京时间）
 
-> 自动生成 · 来源：[CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) main · 更新频率：每天
+> 自动生成 · 来源：[CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) main · 更新频率：每 6 小时
 
 ## 会员（Premium）模型
 

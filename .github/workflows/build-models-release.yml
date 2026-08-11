@@ -2,7 +2,7 @@ name: 构建 Freebuff 模型快照并更新 MODELS.md
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # 每天 06:00 UTC（北京时间 14:00）
+    - cron: "0 */6 * * *" # 每 6 小时（UTC 00/06/12/18；北京时间 08/14/20/02）
   workflow_dispatch:
 
 permissions:

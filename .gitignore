@@ -27,3 +27,9 @@ wrangler.toml
 
 # 本地日志分析文件，绝不提交
 logs/
+
+# Hermes 本地计划、实验补丁和会话资料，仅本地保存
+.hermes/
+
+# 本地额度验证脚本，仅本地使用
+freebuff_tools/test_extract_freebuff_quota.py
