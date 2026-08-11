@@ -1,4 +1,4 @@
-# Freebuff 可用模型（2026-08-11 08:05:39 北京时间）
+# Freebuff 可用模型（2026-08-11 15:02:38 北京时间）
 
 > 自动生成 · 来源：[CodebuffAI/freebuff](https://github.com/CodebuffAI/freebuff) main · 更新频率：每天
 
@@ -9,8 +9,6 @@
 - `meta/muse-spark-1.2-contributor` —— Muse Spark 1.2（Meta 开发者专属，限量）
 - `minimax/minimax-m3` —— MiniMax M3（综合能力强，中文优秀）
 - `openai/gpt-5.6-luna` —— GPT-5.6 Luna（OpenAI 最新，推理顶尖）
-- `openrouter/poolside/laguna-s-2.1` —— Laguna S 2.1（OpenRouter 通道）
-- `poolside/laguna-s-2.1` —— Laguna S 2.1（Poolside 代码专用模型）
 
 ## 标准（STANDARD）模型
 
@@ -23,4 +21,4 @@
 - `z-ai/glm-5.2` —— GLM 5.2（智谱 AI，推荐解锁后使用）
 
 ---
-共 11 个模型 · 上次更新：2026-08-11 08:05:39
+共 9 个模型 · 上次更新：2026-08-11 15:02:38
