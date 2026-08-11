@@ -30,13 +30,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DATE=$(date -u +%Y%m%d-%H%M%S)
-          gh release delete latest --yes --repo "${GITHUB_REPOSITORY}" 2>/dev/null || true
-          gh release create "models-${DATE}" freebuff-models.json \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "Freebuff Models (${DATE})" \
-            --notes "动态模型映射快照（北京时间 $(TZ=Asia/Shanghai date +%Y-%m-%d\ %H:%M)）" \
-            --latest
+          TAG="models-cache"
+          FILE="freebuff-models.json"
+          # 固定 tag 的 release 只创建一次，之后每次更新 asset
+          gh release view "$TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${GITHUB_REPOSITORY}" \
+              --title "Freebuff Models (auto)" \
+              --notes "每日自动更新的动态模型映射快照（Worker 兜底源）" \
+              --latest
+          gh release delete-asset "$TAG" "$FILE" --repo "${GITHUB_REPOSITORY}" --yes 2>/dev/null || true
+          gh release upload "$TAG" "$FILE" --repo "${GITHUB_REPOSITORY}" --clobber
+          echo "✅ Release asset 已更新 (tag: $TAG)"
 
       - name: 提交 MODELS.md 更新到 main（保持工作流活跃，防止 60 天无活动被禁用）
         run: |
