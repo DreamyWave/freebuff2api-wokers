@@ -58,21 +58,30 @@ function parseModelIdConstants(source) {
   return table;
 }
 
-function parseAgentMapping(source, modelIdConstants) {
-  const mapping = {};
-  const blockRe = /FREEBUFF_ROOT_AGENT_ID_BY_MODEL[^=]*=\s*\{([^}]*)\}/;
-  const blockMatch = blockRe.exec(source);
-  if (!blockMatch) return mapping;
-  const body = blockMatch[1];
+function parseAgentMappings(source, modelIdConstants) {
+  const blockNames = {
+    root: "FREEBUFF_ROOT_AGENT_ID_BY_MODEL",
+    base3: "FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL",
+    reviewer: "FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL",
+  };
+  const result = { root: {}, base3: {}, reviewer: {} };
   const lineRe = /\[\s*([A-Z0-9_]+)\s*\]\s*:\s*'([^']+)'/g;
-  let m;
-  while ((m = lineRe.exec(body)) !== null) {
-    const constName = m[1];
-    const agentId = m[2];
-    const modelId = modelIdConstants[constName];
-    if (modelId) mapping[modelId] = agentId;
+  for (const [kind, blockName] of Object.entries(blockNames)) {
+    const blockRe = new RegExp(`${blockName}[^=]*=\\s*\\{([^}]*)\\}`);
+    const blockMatch = blockRe.exec(source);
+    if (!blockMatch) continue;
+    lineRe.lastIndex = 0;
+    let m;
+    while ((m = lineRe.exec(blockMatch[1])) !== null) {
+      const modelId = modelIdConstants[m[1]];
+      if (modelId) result[kind][modelId] = m[2];
+    }
   }
-  return mapping;
+  return result;
+}
+
+function parseAgentMapping(source, modelIdConstants) {
+  return parseAgentMappings(source, modelIdConstants).root;
 }
 
 function parseModelPools(source, modelIdConstants) {
@@ -164,16 +173,19 @@ async function main() {
       ...parseModelIdConstants(stableIdsSrc || ""),
       ...parseModelIdConstants(modelsSrc),
     };
-    const agentMapping = parseAgentMapping(agentsSrc, modelIdConstants);
-    if (Object.keys(agentMapping).length === 0) {
+    const agentMappings = parseAgentMappings(agentsSrc, modelIdConstants);
+    if (Object.keys(agentMappings.root).length === 0) {
       console.error("❌ 解析 agent 映射为空，不生成 JSON");
       process.exit(1);
     }
     const pools = parseModelPools(modelsSrc, modelIdConstants);
-    const models = Object.entries(agentMapping).map(([modelId, agentId]) => ({
+    const models = Object.entries(agentMappings.root).map(([modelId, rootAgent]) => ({
       id: modelId,
       session: modelId,
-      agent: agentId,
+      agent: rootAgent,
+      root_agent: rootAgent,
+      base3_agent: agentMappings.base3[modelId] || null,
+      reviewer_agent: agentMappings.reviewer[modelId] || null,
       upstream: modelId,
     }));
     const premium = new Set(pools.premium);

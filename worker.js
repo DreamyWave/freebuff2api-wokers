@@ -1,7 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.4";
+const VERSION = "1.8.5";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
@@ -70,26 +70,33 @@ function parseModelIdConstants(source) {
   return table;
 }
 
-// 解析 free-agents.ts 的 FREEBUFF_ROOT_AGENT_ID_BY_MODEL 映射
-// 形如: [FREEBUFF_MIMO_V25_MODEL_ID]: 'base2-free-mimo',
-// 用常量表把 [CONST] 键展开成真实模型 ID
-function parseAgentMapping(source, modelIdConstants) {
-  const mapping = {};
-  // 找到 FREEBUFF_ROOT_AGENT_ID_BY_MODEL = { ... } 块
-  const blockRe = /FREEBUFF_ROOT_AGENT_ID_BY_MODEL[^=]*=\s*\{([^}]*)\}/;
-  const blockMatch = blockRe.exec(source);
-  if (!blockMatch) return mapping;
-  const body = blockMatch[1];
-  // 每行: [CONST_NAME]: 'agent-id',
+// 解析 free-agents.ts 中按用途分开的 agent 映射。
+// 不把 base2 root、base3 root、reviewer 混为一张表：它们属于不同运行路径。
+function parseAgentMappings(source, modelIdConstants) {
+  const blockNames = {
+    root: "FREEBUFF_ROOT_AGENT_ID_BY_MODEL",
+    base3: "FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL",
+    reviewer: "FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL",
+  };
+  const result = { root: {}, base3: {}, reviewer: {} };
   const lineRe = /\[\s*([A-Z0-9_]+)\s*\]\s*:\s*'([^']+)'/g;
-  let m;
-  while ((m = lineRe.exec(body)) !== null) {
-    const constName = m[1];
-    const agentId = m[2];
-    const modelId = modelIdConstants[constName];
-    if (modelId) mapping[modelId] = agentId;
+  for (const [kind, blockName] of Object.entries(blockNames)) {
+    const blockRe = new RegExp(`${blockName}[^=]*=\\s*\\{([^}]*)\\}`);
+    const blockMatch = blockRe.exec(source);
+    if (!blockMatch) continue;
+    let m;
+    lineRe.lastIndex = 0;
+    while ((m = lineRe.exec(blockMatch[1])) !== null) {
+      const modelId = modelIdConstants[m[1]];
+      if (modelId) result[kind][modelId] = m[2];
+    }
   }
-  return mapping;
+  return result;
+}
+
+// 兼容旧调用方：默认返回普通 base2 root 映射。
+function parseAgentMapping(source, modelIdConstants) {
+  return parseAgentMappings(source, modelIdConstants).root;
 }
 
 // 解析 freebuff-models.ts 的池定义（PREMIUM / GLM；STANDARD 由 non-premium 推导）
@@ -152,12 +159,20 @@ function parseModelPools(source, modelIdConstants) {
   return { premium: [...premium], glm: [...glm] };
 }
 
-// 动态模型表：agent 映射 → [{ id, session, agent, upstream }]
-function buildDynamicModelTable(agentMapping) {
-  return Object.entries(agentMapping).map(([modelId, agentId]) => ({
+// 动态模型表：分别记录普通 root、base3 root、reviewer。
+function buildDynamicModelTable(agentMappings) {
+  // 兼容旧调用：传入单张 root mapping 时仍可正常构建。
+  const mappings = agentMappings && agentMappings.root
+    ? agentMappings
+    : { root: agentMappings || {}, base3: {}, reviewer: {} };
+  return Object.entries(mappings.root).map(([modelId, rootAgent]) => ({
     id: modelId,
     session: modelId,
-    agent: agentId,
+    // 旧字段保留为普通 root，普通 chat 永远使用它。
+    agent: rootAgent,
+    root_agent: rootAgent,
+    base3_agent: mappings.base3[modelId] || null,
+    reviewer_agent: mappings.reviewer[modelId] || null,
     upstream: modelId,
   }));
 }
@@ -218,8 +233,8 @@ async function refreshDynamicModelsIfStale() {
   try {
     // 合并常量表：models.ts 优先（完整），stableIds.ts 补充 deepseek/m3
     const modelIdConstants = { ...parseModelIdConstants(stableIdsSrc || ""), ...parseModelIdConstants(modelsSrc) };
-    const agentMapping = parseAgentMapping(agentsSrc, modelIdConstants);
-    if (Object.keys(agentMapping).length === 0) {
+    const agentMappings = parseAgentMappings(agentsSrc, modelIdConstants);
+    if (Object.keys(agentMappings.root).length === 0) {
       // 解析失败：尝试 Releases 兜底
       const release = await tryReleaseFallback();
       if (release) {
@@ -231,7 +246,7 @@ async function refreshDynamicModelsIfStale() {
     const pools = parseModelPools(modelsSrc, modelIdConstants);
     dynamicModelsCache = {
       fetchedAt: Date.now(),
-      models: buildDynamicModelTable(agentMapping),
+      models: buildDynamicModelTable(agentMappings),
       pool: {
         premium: new Set(pools.premium),
         standard: null,
@@ -735,9 +750,17 @@ function enqueueUp(method, path, token, body, extraHeaders, timeoutMs) {
   return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs));
 }
 
+// 流式无首数据时的额度检查：只读本地缓存，绝不打上游。
+// ⚠️ 不能在这里 GET /api/v1/freebuff/session 强制刷新：
+// 该接口会占用账号 session，而 freebuff 一个号同一时间只能一个客户端在线，
+// 探测会顶掉正在推理的会话（428 waiting_room_required）。luna effort=high
+// 等长推理模型首 token 可能 >20s，此时探测必然误伤。
+// 缓存缺失/过期/额度未知 → 一律不判定耗尽，继续等待上游。
 async function freshQuotaProbe(token, sessionModel) {
-  const info = await probeAccount(token, true);
-  if (isQuotaExhausted(info, sessionModel)) throw new QuotaExhaustedError(info);
+  const cached = acctHealth.get(token);
+  if (!cached) return;
+  if (Date.now() - cached.checkedAt > PROBE_TTL_MS) return;
+  if (isQuotaExhausted(cached, sessionModel)) throw new QuotaExhaustedError(cached);
 }
 
 // 流式 chat 不设置总时长 abort。只有在首个数据迟迟未到时，
@@ -995,6 +1018,56 @@ function buildUpstreamPayload(params, mc, sess, runId) {
   return payload;
 }
 
+// 第一阶段显式代码审计模式：只在调用方明确请求时触发 reviewer 子 run。
+// 普通 chat 永远只使用 root agent，不把 reviewer 当成模型 fallback。
+function isCodeReviewRequest(params) {
+  return params && params.metadata && params.metadata.freebuff_mode === "code_review";
+}
+
+function buildReviewerMessages(params) {
+  const messages = Array.isArray(params.messages)
+    ? params.messages.map((m) => ({ ...m }))
+    : [];
+  // 与官方 createReviewer() 对齐：reviewer 继承 root 上下文，但不能调用工具或修改文件。
+  messages.unshift({
+    role: "system",
+    content: "You are a subagent that reviews code changes and gives helpful critical feedback. Do not use any tools. Review the last file changes made by the assistant. Focus on missing requirements, correctness, regressions, dead code, missing imports, and consistency with the existing code. Be extremely concise and only suggest changes; do not modify files.",
+  });
+  const requestedPrompt = params.metadata && typeof params.metadata.freebuff_review_prompt === "string"
+    ? params.metadata.freebuff_review_prompt.trim()
+    : "";
+  messages.push({
+    role: "user",
+    content: requestedPrompt ||
+      "Review the recent code changes in the conversation. Give concise, critical feedback only.",
+  });
+  return messages;
+}
+
+function buildReviewerPayload(params, mc, sess, reviewerRunId) {
+  const metadata = params.metadata && typeof params.metadata === "object"
+    ? { ...params.metadata }
+    : undefined;
+  if (metadata) {
+    delete metadata.freebuff_mode;
+    delete metadata.freebuff_review_prompt;
+  }
+  return buildUpstreamPayload(
+    {
+      ...params,
+      metadata,
+      messages: buildReviewerMessages(params),
+      // 官方 code-reviewer 的 toolNames=[]：reviewer 只能给建议，不能调用工具。
+      tools: undefined,
+      tool_choice: undefined,
+      parallel_tool_calls: undefined,
+    },
+    mc,
+    sess,
+    reviewerRunId,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // chat 主流程
 // ---------------------------------------------------------------------------
@@ -1011,11 +1084,28 @@ function findModelConfig(modelId) {
   return null;
 }
 
+// 查找模型配置前确保动态注册表已加载。
+// 不能依赖 /v1/models 先被调用：Cloudflare 不保证两个请求落在同一 isolate。
+async function resolveModelConfig(modelId) {
+  let hit = findModelConfig(modelId);
+  if (hit) return hit;
+  try {
+    const dyn = await refreshDynamicModelsIfStale();
+    if (dyn && dyn.models) {
+      hit = dyn.models.find((m) => m.id === modelId) || null;
+      if (hit) return hit;
+    }
+  } catch {}
+  return findModelConfig(modelId);
+}
+
 async function handleChat(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
-  const mc = findModelConfig(params.model || DEFAULT_MODEL) || MODELS[0];
+  const requestedModel = params.model || DEFAULT_MODEL;
+  const mc = await resolveModelConfig(requestedModel);
+  if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   return executeChat(env, params, mc, isStream, "chat");
 }
 
@@ -1024,7 +1114,9 @@ async function handleResponses(request, env) {
   let params;
   try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
   const isStream = !!params.stream;
-  const mc = findModelConfig(params.model || DEFAULT_MODEL) || MODELS[0];
+  const requestedModel = params.model || DEFAULT_MODEL;
+  const mc = await resolveModelConfig(requestedModel);
+  if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
   return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
 }
 
@@ -1101,8 +1193,99 @@ function responsesInputToMessages(input, instructions) {
   return messages;
 }
 
+// 第一阶段：显式代码审计模式。
+// 这是 reviewer-only 入口：创建 root run 作为父链，再创建 code-reviewer 子 run，
+// 不执行普通 root chat，也不把 reviewer agent 混入普通模型路由。
+async function executeCodeReview(env, chatParams, mc, isStream, mode) {
+  const debug = env.FREEBUFF_DEBUG === "true";
+  const reviewerAgent = mc.reviewer_agent;
+  const reviewerModel = mc.upstream;
+  if (!reviewerAgent) {
+    return jsonResponse({
+      error: {
+        message: "Code review is not available for model: " + mc.id,
+        type: "unsupported_review_agent",
+      },
+    }, 400);
+  }
+
+  const pool = parseAccounts(env);
+  if (pool.length === 0) {
+    return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
+  }
+
+  let lastErrMsg = "";
+  for (let acctTry = 0; acctTry < pool.length; acctTry++) {
+    const acct = pickToken(env, mc.session);
+    const token = acct ? acct.token : null;
+    if (!token) break;
+    let rootRunId = null;
+    let reviewerRunId = null;
+    try {
+      const sess = await createSession(token, mc.session);
+      const root = await startRunChain(token, mc.root_agent || mc.agent);
+      rootRunId = root.runId;
+      // Desktop 协议的关键：reviewer 是 root run 的子 run。
+      reviewerRunId = await startRun(token, reviewerAgent, [rootRunId]);
+      if (debug) console.log(`[review][acct ${acctTry + 1}] root=${rootRunId} reviewer=${reviewerRunId} model=${reviewerModel}`);
+
+      const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId);
+      const headers = {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json",
+        "x-freebuff-instance-id": sess.instanceId,
+        "User-Agent": DESKTOP_CHAT_UA,
+      };
+      const resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: isStream ? undefined : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
+        cooldown(token, parseCooldown(text, resp.status));
+        throw new Error(lastErrMsg);
+      }
+
+      let finalized = false;
+      const finalize = async () => {
+        if (finalized) return;
+        finalized = true;
+        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+      };
+
+      if (isStream) {
+        const { readable, writable } = new TransformStream();
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalize);
+        else pipeUpstreamToClient(resp.body, writable, finalize);
+        return new Response(readable, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
+        });
+      }
+
+      const result = mode === "responses"
+        ? await responsesToNonStream(resp.body, mc)
+        : await streamToNonStream(resp.body, reviewerModel);
+      await finalize();
+      return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
+    } catch (e) {
+      console.error("[code_review]", e);
+      lastErrMsg = String(e.message || e);
+      if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+      if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+      if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
+    }
+  }
+  return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
+}
+
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
 async function executeChat(env, chatParams, mc, isStream, mode) {
+  if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
@@ -1332,7 +1515,9 @@ function estimateAnthropicTokens(value) {
 async function handleAnthropicCountTokens(request, env) {
   let body;
   try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
-  const mc = findModelConfig(anthropicModelToOpenAI(body.model)) || MODELS[0];
+  const openaiModel = anthropicModelToOpenAI(body.model);
+  const mc = findModelConfig(openaiModel);
+  if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
   return jsonResponse({ input_tokens: Math.max(1, Math.ceil(estimateAnthropicTokens(chat.messages) / 4)) }, 200);
 }
@@ -1385,7 +1570,9 @@ function anthropicStream(mc) {
 async function handleAnthropicMessages(request, env) {
   let body;
   try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
-  const mc = findModelConfig(anthropicModelToOpenAI(body.model)) || MODELS[0];
+  const openaiModel = anthropicModelToOpenAI(body.model);
+  const mc = findModelConfig(openaiModel);
+  if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
   const chat = anthropicToChat(body, mc);
   const response = await executeChat(env, chat, mc, !!chat.stream, "chat");
   if (response.status >= 400) {
@@ -1405,7 +1592,7 @@ function unwrapData(obj) {
 }
 
 // 流式：把上游 SSE 剥 {data:...} 包装后透传
-function pipeUpstreamToClient(upstreamBody, writable) {
+function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
@@ -1433,7 +1620,10 @@ function pipeUpstreamToClient(upstreamBody, writable) {
         }
       }
     } catch {}
-    finally { try { await writer.close(); } catch {} }
+    finally {
+      try { if (onComplete) await onComplete(); } catch {}
+      try { await writer.close(); } catch {}
+    }
   })();
 }
 
@@ -1542,7 +1732,7 @@ function chatUsageToResponsesUsage(usage) {
 }
 
 // 流式：上游 chat SSE → Responses API 事件序列（response.created … response.completed）
-async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc) {
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete) {
   const reader = upstreamBody.getReader();
   const writer = writable.getWriter();
   const decoder = new TextDecoder();
@@ -1677,7 +1867,10 @@ async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc) {
       resp.usage = chatUsageToResponsesUsage(usage);
       await send({ type: "response.completed", response: resp });
     } catch {}
-    finally { try { await writer.close(); } catch {} }
+    finally {
+      try { if (onComplete) await onComplete(); } catch {}
+      try { await writer.close(); } catch {}
+    }
   })();
 }
 
