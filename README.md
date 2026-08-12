@@ -5,6 +5,9 @@
 > 🎉 欢迎使用与交流！有任何问题或想法欢迎提 Issue / PR。
 > 开源协议：**[MIT](#-license)**
 
+> 🙏 **感谢以下贡献者**（排名不分先后）：
+> [@yjzsg](https://github.com/yjzsg) · [@zipei-a](https://github.com/zipei-a) · [@hknerdr](https://github.com/hknerdr)
+
 把 **freebuff/codebuff** 的免费模型暴露成 **OpenAI-compatible API**。单文件无依赖，**推荐 Docker 容器部署**（或自建 VPS 运行），适配任意 OpenAI SDK / 客户端（QwenPaw、Hermes、ChatGPT-Next-Web、LobeChat、one-api 等）。
 
 > ⚠️ **部署方式重要提示**：Freebuff 官方已检测 Cloudflare Worker 部署（识别 `cf-worker` / `cf-ray` 等边缘标记），**在 CF 上部署会显著增加账号被封禁的风险**。因此本项目**不推荐 Cloudflare 部署**，推荐使用 **Docker 容器**或自建 VPS 运行（见下方「[🐳 Docker 容器化部署](#-docker-容器化部署-推荐)」）。
