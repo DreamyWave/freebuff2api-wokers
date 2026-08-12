@@ -20,6 +20,9 @@ CHANGELOG.md
 # wrangler 本地缓存/状态，不提交
 .wrangler/
 
+# Vercel 本地缓存/项目文件，不提交
+.vercel/
+
 # ⚠️ wrangler.toml 含敏感变量（FREEBUFF_TOKEN 等），绝不提交 GitHub
 wrangler.toml
 
