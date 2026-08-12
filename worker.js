@@ -1,7 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.8.1";
+const VERSION = "1.8.9";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
@@ -1062,9 +1062,58 @@ function normalizeMessages(messages) {
   return out;
 }
 
+// 官方模型 reasoning effort 上限表（2026-08-12 源码：freebuff-models.ts / reasoning-effort.ts）
+// 模型只允许其 efforts 数组中的档位；请求档位超出上限时 clamp-down 到最近可用档，
+// 不拒绝请求、不换模型（官方 clampReasoningEffort 语义）。
+// 档位升序 ladder：minimal < low < medium < high < xhigh < max < ultra
+const REASONING_EFFORT_RANK = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+// 官方 per-model efforts：
+//   - deepseek-v4-flash: [low, high, max]（无 medium）
+//   - deepseek-v4-pro:   [high, max]
+//   - gpt-5.6-luna:      EFFORTS_THROUGH_MAX（low..max）
+//   - muse-spark:        EFFORTS_THROUGH_XHIGH（low..xhigh，ALWAYS reasons，none=400）
+//   - minimax-m3:        无 effort（官方 adaptive/disabled thinking，不设档位）
+//   - 未列出的模型：无限制，原样透传
+const MODEL_EFFORTS = {
+  "deepseek/deepseek-v4-flash": ["low", "high", "max"],
+  "deepseek/deepseek-v4-pro": ["high", "max"],
+  "openai/gpt-5.6-luna": ["low", "medium", "high", "max"],
+  "meta/muse-spark-1.2-contributor": ["low", "medium", "high", "xhigh"],
+};
+
+function clampReasoningEffort(requested, allowed) {
+  if (!Array.isArray(allowed) || allowed.length === 0) return requested;
+  const wanted = REASONING_EFFORT_RANK.indexOf(requested);
+  if (wanted < 0) return requested; // 未知档位 → 原样透传，交由上游
+  let best = null;
+  let bestRank = -1;
+  for (const cand of allowed) {
+    const rank = REASONING_EFFORT_RANK.indexOf(cand);
+    if (rank < 0 || rank > wanted) continue;
+    if (rank > bestRank) { best = cand; bestRank = rank; }
+  }
+  if (best !== null) return best;
+  // 所有可用档都高于请求 → 取最低档（官方语义）
+  return allowed.reduce((lo, c) =>
+    REASONING_EFFORT_RANK.indexOf(c) < REASONING_EFFORT_RANK.indexOf(lo) ? c : lo);
+}
+
+function normalizeReasoningEffort(model, effort) {
+  if (effort === undefined || effort === null) return effort;
+  const allowed = MODEL_EFFORTS[model];
+  if (!allowed) return effort; // 模型未列 → 不干预
+  const clamped = clampReasoningEffort(String(effort), allowed);
+  return clamped === String(effort) ? effort : clamped;
+}
+
 function buildUpstreamPayload(params, mc, sess, runId) {
   const payload = {};
   for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
+  // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）
+  if (payload.reasoning_effort !== undefined) {
+    payload.reasoning_effort = normalizeReasoningEffort(mc.id, payload.reasoning_effort);
+  }
   payload.model = mc.upstream;
   payload.messages = normalizeMessages(params.messages);
   payload.stream = true;
@@ -1532,7 +1581,11 @@ function anthropicToChat(body, mc) {
   if (body.max_tokens != null) chat.max_completion_tokens = body.max_tokens;
   for (const k of ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"]) if (body[k] != null) chat[k] = body[k];
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) chat.stop = body.stop_sequences;
-  if (body.thinking?.type === "enabled" && Number.isFinite(body.thinking.budget_tokens)) chat.reasoning_effort = body.thinking.budget_tokens >= 16000 ? "high" : body.thinking.budget_tokens >= 8000 ? "medium" : "low";
+  if (body.thinking?.type === "enabled" && Number.isFinite(body.thinking.budget_tokens)) {
+    // Anthropic thinking budget → reasoning effort 分档；经 clamp 归一化后即使产生
+    // medium（如 deepseek-v4-flash 不支持）也会被钳到最近可用档
+    chat.reasoning_effort = body.thinking.budget_tokens >= 16000 ? "high" : body.thinking.budget_tokens >= 8000 ? "medium" : "low";
+  }
   if (body.metadata && typeof body.metadata === "object") chat.metadata = body.metadata;
 
   if (Array.isArray(body.tools) && body.tools.length) {
