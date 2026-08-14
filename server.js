@@ -20,7 +20,14 @@ if (existsSync(credDir)) {
     try {
       const raw = readFileSync(resolve(credDir, f), 'utf-8');
       const obj = JSON.parse(raw);
+      // 单账号格式：顶层 authToken（credentials/<name>.json）
       if (obj.authToken) tokenLines.push(obj.authToken.trim());
+      // 多账号聚合格式（freebuff_credentials.json）：accounts.<key>.authToken
+      if (obj.accounts && typeof obj.accounts === 'object') {
+        for (const acct of Object.values(obj.accounts)) {
+          if (acct && acct.authToken) tokenLines.push(acct.authToken.trim());
+        }
+      }
     } catch (err) {
       console.error(`[server] skip bad credential ${f}: ${err.message}`);
     }

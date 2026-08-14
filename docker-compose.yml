@@ -16,4 +16,5 @@ services:
       - FREEBUFF_API_KEY=${FREEBUFF_API_KEY}
       - FREEBUFF_DEBUG=false
     volumes:
-      - ./credentials:/app/credentials:ro
+      # 统一凭证：直接复用本地工具的 freebuff_credentials.json（多账号聚合格式）
+      - ./freebuff_tools/freebuff_credentials.json:/app/credentials/freebuff_credentials.json:ro
