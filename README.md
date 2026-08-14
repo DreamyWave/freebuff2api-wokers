@@ -1,9 +1,9 @@
 # freebuff2api-workers
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 > 🎉 欢迎使用与交流！有任何问题或想法欢迎提 Issue / PR。
-> 开源协议：**[MIT](#-license)**
+> 开源协议：**[AGPL-3.0](#-license)**
 
 把 **freebuff/codebuff** 的免费模型暴露成 **OpenAI-compatible API**。单文件无依赖，**推荐 Docker 容器部署**（或自建 VPS 运行），适配任意 OpenAI SDK / 客户端（QwenPaw、Hermes、ChatGPT-Next-Web、LobeChat、one-api 等）。
 
@@ -342,6 +342,14 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 - [@zipei-a](https://github.com/zipei-a)
 - [@hknerdr](https://github.com/hknerdr)
 
+## 📚 学习参考项目
+
+本项目在开发过程中参考并学习了以下开源项目，特此感谢：
+
+- [freebuff2api](https://github.com/XxxXTeam/freebuff2api) —— freebuff 桌面版/API 协议逆向与代理的原始实现（AGPL-3.0），本项目在其基础上进行二次开发与优化，并沿用 AGPL-3.0 开源。
+- [freebuff](https://github.com/CodebuffAI/freebuff) —— freebuff 官方公开源码，本项目通过阅读其协议实现与更新日志进行学习研究。
+- [Argo-Nezha-Service-Container](https://github.com/fscarmen/Argo-Nezha-Service-Container) —— **容器引导器模式**（Dockerfile 只做引导，业务逻辑由远程脚本/代码驱动），本项目 Docker 部署方式借鉴了该设计，实现"改代码即更新、重启即生效"的轻量管理。
+
 ## ⚠️ 免责声明
 
 本项目仅供**技术交流与学习研究**使用。
@@ -353,6 +361,6 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 
 ## 📄 License
 
-本项目采用 [MIT License](LICENSE)，欢迎自由使用、修改与分享。
+本项目采用 [AGPL-3.0 License](LICENSE)。本项目参考并改写了 [freebuff2api](https://github.com/XxxXTeam/freebuff2api) 的部分代码与结构（原项目为 AGPL-3.0），因此本项目同样以 AGPL-3.0 开源；使用时请保留原版权声明，欢迎自由使用、修改与分享。
 
 
