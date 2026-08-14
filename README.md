@@ -131,18 +131,20 @@ python3 extract_freebuff.py chat "你好"      # 发一条消息测试模型 API
 
 ## 🛠️ 部署
 
-### 🐳 Docker 容器化部署（✅ 推荐）
+### 🐳 Docker 容器化部署（✅ 推荐，一键 compose）
 
-> 适合本地/NAS/VPS 长期运行：不受 Cloudflare Workers 限制，**不会暴露 CF 边缘标记**（`cf-worker` / `cf-ray`），账号封禁风险显著低于 CF 部署；同一套代码也可在 CF 运行（不推荐）。
+> 适合本地/NAS/VPS 长期运行：不受 Cloudflare Workers 限制，**不会暴露 CF 边缘标记**（`cf-worker` / `cf-ray`），账号封禁风险显著低于 CF 部署。
 
-**快速部署：**
+**快速部署（一条命令）：**
 
 ```bash
-# 1. 准备目录，复制以下文件：worker.js server.js package.json Dockerfile docker-compose.yml
-mkdir freebuff2api && cd freebuff2api
+# 1. 克隆仓库（含 Dockerfile / docker-compose.yml / entrypoint 引导器）
+git clone https://github.com/pingmike2/freebuff2api-wokers.git
+cd freebuff2api-wokers
 
-# 2. 配置 .env（API key + 可选 RELAY_KEY）
+# 2. 配置 .env（API key + Docker Hub 账号 + 可选 RELAY_KEY）
 cat > .env <<'EOF'
+DOCKERHUB_USERNAME=你的DockerHub用户名
 FREEBUFF_API_KEY=your-api-key
 RELAY_KEY=
 EOF
@@ -151,9 +153,16 @@ EOF
 mkdir -p credentials
 # credentials/<任意名>.json = {"email": "...", "authToken": "...", "name": "..."}
 
-# 4. 启动
+# 4. 一键启动（拉取 Docker Hub 镜像并运行）
 chmod 600 .env credentials/*.json
-docker compose up -d --build
+docker compose pull && docker compose up -d
+```
+
+**更新方式（不用重新构建镜像）：** 由于 Dockerfile 采用**容器引导器模式**（借鉴 fscarmen/Argo-Nezha-Service-Container），容器每次启动时会自动从 GitHub raw 地址拉取最新 `worker.js`（拉取失败则回退镜像内置副本）。因此：
+
+```bash
+# 改完 worker.js 推送 GitHub 后，重启容器即自动更新：
+docker compose restart
 ```
 
 启动后监听 `0.0.0.0:8787`（compose 映射到宿主机 `8877`），Base URL 为 `http://localhost:8877/v1`。
@@ -162,6 +171,7 @@ docker compose up -d --build
 
 | 变量 | 说明 |
 |---|---|
+| `DOCKERHUB_USERNAME` | Docker Hub 用户名（镜像 `$DOCKERHUB_USERNAME/freebuff2api:latest`） |
 | `PORT` / `HOST` | 监听端口/地址，默认 `8787` / `0.0.0.0` |
 | `FREEBUFF_API_KEY` | 本 API 访问 key（缺省 `freebuff-default-key`） |
 | `FREEBUFF_DEBUG` | `true` 开启请求级调试日志 |
@@ -169,6 +179,8 @@ docker compose up -d --build
 | `RELAY_KEY` | 中继密钥（`CODEBUFF_API` 指向带鉴权的中继时必填） |
 
 > ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
+
+**维护者打包镜像（发布到 Docker Hub）：** 仓库已配置 `.github/workflows/docker-publish.yml`（手动触发，多架构 amd64/arm64），需在 GitHub Secrets 配置 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 后，在 Actions 页面手动 Run workflow 即可发布新镜像。
 
 ### Cloudflare Worker 部署（❌ 不推荐）
 
