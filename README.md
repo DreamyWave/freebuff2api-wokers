@@ -142,9 +142,9 @@ python3 extract_freebuff.py chat "你好"      # 发一条消息测试模型 API
 #### 方式一：一键 `docker run`（最快）
 
 ```bash
-# 1. 准备凭据目录（每个账号一个 json，server.js 读取 authToken 字段）
-mkdir -p credentials
-# credentials/<任意名>.json = {"email": "...", "authToken": "...", "name": "..."}
+# 1. 准备凭据文件 freebuff_credentials.json（多账号聚合格式，见「获取 authToken」）
+#    用提取工具生成：python3 freebuff_tools/extract_freebuff.py login
+#    或手动创建：{"accounts": {"<账号id>": {"email": "...", "authToken": "...", "name": "..."}}}
 
 # 2. 一键启动（变量直接内联，或改用 .env 文件）
 docker run -d --name freebuff2api --restart unless-stopped \
@@ -153,7 +153,7 @@ docker run -d --name freebuff2api --restart unless-stopped \
   -e HOST=0.0.0.0 \
   -e FREEBUFF_API_KEY=your-api-key \
   -e RELAY_KEY= \
-  -v "$(pwd)/credentials:/app/credentials:ro" \
+  -v "$(pwd)/freebuff_credentials.json:/app/credentials/freebuff_credentials.json:ro" \
   pingmike/freebuff2api:latest
 ```
 
@@ -170,7 +170,7 @@ EOF
 docker run -d --name freebuff2api --restart unless-stopped \
   -p 8877:8787 \
   --env-file .env \
-  -v "$(pwd)/credentials:/app/credentials:ro" \
+  -v "$(pwd)/freebuff_credentials.json:/app/credentials/freebuff_credentials.json:ro" \
   pingmike/freebuff2api:latest
 ```
 
@@ -195,20 +195,19 @@ services:
       - FREEBUFF_API_KEY=${FREEBUFF_API_KEY}
       - RELAY_KEY=${RELAY_KEY}
     volumes:
-      - ./credentials:/app/credentials:ro
+      - ./freebuff_credentials.json:/app/credentials/freebuff_credentials.json:ro
 EOF
 echo 'FREEBUFF_API_KEY=your-api-key' > .env && \
-mkdir -p credentials && \
 docker compose pull && docker compose up -d
 ```
 
 > 💡 compose 里的 `${FREEBUFF_API_KEY}` / `${RELAY_KEY}` 会自动从同目录的 `.env` 文件读取。
 
-**凭据目录：** 启动前/后放入账号凭据，放入后重启容器生效：
+**凭据文件：** 启动前/后放入账号凭据，放入后重启容器生效：
 
 ```bash
-mkdir -p credentials && chmod 700 credentials
-# credentials/<任意名>.json = {"email": "...", "authToken": "...", "name": "..."}
+chmod 600 freebuff_credentials.json
+# freebuff_credentials.json 多账号聚合格式：{"accounts": {"<账号id>": {"email": "...", "authToken": "...", "name": "..."}}}
 docker compose restart          # 或 docker restart freebuff2api
 ```
 
@@ -233,7 +232,7 @@ docker compose restart                        # 或仅重启（自动拉最新 w
 | `CODEBUFF_API` | 上游地址，默认空=直连 `https://www.codebuff.com`；走自建中继时设为中继域名 |
 | `RELAY_KEY` | 中继密钥（`CODEBUFF_API` 指向带鉴权的中继时必填） |
 
-> ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
+> ⚠️ 容器内 `freebuff_credentials.json` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。`server.js` 兼容两种格式：多账号聚合 `{"accounts": {...}}`（提取工具默认输出）和单账号顶层 `authToken`。
 
 #### 维护者：发布新镜像到 Docker Hub
 
