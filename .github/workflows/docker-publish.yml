@@ -1,14 +1,7 @@
 name: Build and Push Docker Image
 
 on:
-  workflow_dispatch:   # ✅ 手动触发（改代码后手动点一次）
-  push:
-    branches: [main]
-    paths:
-      - 'worker.js'
-      - 'server.js'
-      - 'package.json'
-      - 'Dockerfile'
+  workflow_dispatch:   # ✅ 手动触发
 
 env:
   IMAGE_NAME: freebuff2api
