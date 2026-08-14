@@ -131,38 +131,46 @@ python3 extract_freebuff.py chat "你好"      # 发一条消息测试模型 API
 
 ## 🛠️ 部署
 
-### 🐳 Docker 容器化部署（✅ 推荐，一键 compose）
+### 🐳 Docker 容器化部署（✅ 推荐，镜像一键）
 
-> 适合本地/NAS/VPS 长期运行：不受 Cloudflare Workers 限制，**不会暴露 CF 边缘标记**（`cf-worker` / `cf-ray`），账号封禁风险显著低于 CF 部署。
+> 适合本地/NAS/VPS 长期运行：不受 Cloudflare Workers 限制，**不会暴露 CF 边缘标记**（`cf-worker` / `cf-ray`），账号封禁风险显著低于 CF 部署。镜像已发布到 Docker Hub，**无需 clone 仓库、无需构建**，一条命令即可部署。
 
-**快速部署（一条命令）：**
+**一键部署（镜像方式）：**
 
 ```bash
-# 1. 克隆仓库（含 Dockerfile / docker-compose.yml / entrypoint 引导器）
+# 1. 准备凭据目录（每个账号一个 json，server.js 读取 authToken 字段）
+mkdir -p credentials
+# credentials/<任意名>.json = {"email": "...", "authToken": "...", "name": "..."}
+
+# 2. 一条命令启动（替换 <你的DockerHub用户名>）
+docker run -d --name freebuff2api --restart unless-stopped \
+  -p 8877:8787 \
+  -e PORT=8787 -e HOST=0.0.0.0 \
+  -e FREEBUFF_API_KEY=your-api-key \
+  -v "$(pwd)/credentials:/app/credentials:ro" \
+  <你的DockerHub用户名>/freebuff2api:latest
+```
+
+如果习惯 compose，也可以用仓库里的 `docker-compose.yml`：
+
+```bash
+# 拉取仓库（仅为了拿 compose 文件；也可以只下载 docker-compose.yml 单个文件）
 git clone https://github.com/pingmike2/freebuff2api-wokers.git
 cd freebuff2api-wokers
-
-# 2. 配置 .env（API key + Docker Hub 账号 + 可选 RELAY_KEY）
 cat > .env <<'EOF'
 DOCKERHUB_USERNAME=你的DockerHub用户名
 FREEBUFF_API_KEY=your-api-key
 RELAY_KEY=
 EOF
-
-# 3. 账号凭据：credentials/ 下每个账号一个 json（server.js 读取 authToken 字段）
 mkdir -p credentials
-# credentials/<任意名>.json = {"email": "...", "authToken": "...", "name": "..."}
-
-# 4. 一键启动（拉取 Docker Hub 镜像并运行）
 chmod 600 .env credentials/*.json
 docker compose pull && docker compose up -d
 ```
 
-**更新方式（不用重新构建镜像）：** 由于 Dockerfile 采用**容器引导器模式**（借鉴 fscarmen/Argo-Nezha-Service-Container），容器每次启动时会自动从 GitHub raw 地址拉取最新 `worker.js`（拉取失败则回退镜像内置副本）。因此：
+**更新方式（不用重新构建、不用重新 pull）：** 由于镜像采用**容器引导器模式**（借鉴 fscarmen/Argo-Nezha-Service-Container），容器每次启动时会自动从 GitHub raw 地址拉取最新 `worker.js`（拉取失败则回退镜像内置副本）。因此服务端改完 `worker.js` 推送 GitHub 后，**主部署重启容器即自动更新**；客户端侧偶尔 pull 新镜像即可：
 
 ```bash
-# 改完 worker.js 推送 GitHub 后，重启容器即自动更新：
-docker compose restart
+docker compose restart          # 或 docker restart freebuff2api
 ```
 
 启动后监听 `0.0.0.0:8787`（compose 映射到宿主机 `8877`），Base URL 为 `http://localhost:8877/v1`。
