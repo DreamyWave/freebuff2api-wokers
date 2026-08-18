@@ -69,7 +69,7 @@ jobs:
 
           ssh -i ~/.ssh/vps_key \
             "$VPS_USER@$VPS_HOST" \
-            "echo 'SSH connection successful'; docker ps --filter name=freebuff2api --format 'Container: {{.Names}} | Status: {{.Status}}'"
+            "echo 'SSH connection successful'; sudo docker ps --filter name=freebuff2api --format 'Container: {{.Names}} | Status: {{.Status}}'"
 
           rm -f ~/.ssh/vps_key
       - name: Restart freebuff2api on VPS
