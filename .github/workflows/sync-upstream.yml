@@ -53,7 +53,25 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "worker.js did not change."
           fi
+      - name: Test VPS SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
 
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/vps_key \
+            "$VPS_USER@$VPS_HOST" \
+            "echo 'SSH connection successful'; docker ps --filter name=freebuff2api --format 'Container: {{.Names}} | Status: {{.Status}}'"
+
+          rm -f ~/.ssh/vps_key
       - name: Restart freebuff2api on VPS
         if: steps.changed.outputs.changed == 'true'
         env:
