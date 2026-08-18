@@ -14,11 +14,9 @@ jobs:
 
     steps:
       - name: Sync fork with upstream
-        uses: tgymnich/fork-sync@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          owner: pingmike2
-          repo: freebuff2api-wokers
-          base: main
-          head: main
-          direction: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh repo sync DreamyWave/freebuff2api-wokers \
+            --source pingmike2/freebuff2api-wokers \
+            --branch main
