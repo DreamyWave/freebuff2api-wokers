@@ -1,4 +1,4 @@
-name: Sync upstream
+name: Sync upstream and update VPS
 
 on:
   schedule:
@@ -13,6 +13,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Get current worker.js SHA
+        id: before
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA=$(gh api \
+            repos/DreamyWave/freebuff2api-wokers/contents/worker.js \
+            --jq '.sha')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Current worker.js: $SHA"
+
       - name: Sync fork with upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -20,3 +31,46 @@ jobs:
           gh repo sync DreamyWave/freebuff2api-wokers \
             --source pingmike2/freebuff2api-wokers \
             --branch main
+
+      - name: Get new worker.js SHA
+        id: after
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA=$(gh api \
+            repos/DreamyWave/freebuff2api-wokers/contents/worker.js \
+            --jq '.sha')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "New worker.js: $SHA"
+
+      - name: Check whether worker.js changed
+        id: changed
+        run: |
+          if [ "${{ steps.before.outputs.sha }}" != "${{ steps.after.outputs.sha }}" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "worker.js changed!"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "worker.js did not change."
+          fi
+
+      - name: Restart freebuff2api on VPS
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/vps_key \
+            "$VPS_USER@$VPS_HOST" \
+            "docker restart freebuff2api"
+
+          rm -f ~/.ssh/vps_key
