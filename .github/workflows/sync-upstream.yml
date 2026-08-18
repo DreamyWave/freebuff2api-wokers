@@ -13,33 +13,35 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Get current worker.js SHA
         id: before
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SHA=$(gh api \
-            repos/DreamyWave/freebuff2api-wokers/contents/worker.js \
-            --jq '.sha')
+          SHA=$(git rev-parse HEAD:worker.js)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Current worker.js: $SHA"
 
-      - name: Sync fork with upstream
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge upstream
         run: |
-          gh repo sync DreamyWave/freebuff2api-wokers \
-            --source pingmike2/freebuff2api-wokers \
-            --branch main
+          git remote add upstream https://github.com/pingmike2/freebuff2api-wokers.git
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork is already up to date."
+          else
+            git merge --no-edit upstream/main
+            git push origin main
+          fi
 
       - name: Get new worker.js SHA
         id: after
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SHA=$(gh api \
-            repos/DreamyWave/freebuff2api-wokers/contents/worker.js \
-            --jq '.sha')
+          SHA=$(git rev-parse HEAD:worker.js)
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "New worker.js: $SHA"
 
@@ -53,25 +55,7 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "worker.js did not change."
           fi
-      - name: Test VPS SSH
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
 
-          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
-          chmod 600 ~/.ssh/vps_key
-
-          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
-
-          ssh -i ~/.ssh/vps_key \
-            "$VPS_USER@$VPS_HOST" \
-            "echo 'SSH connection successful'; sudo docker ps --filter name=freebuff2api --format 'Container: {{.Names}} | Status: {{.Status}}'"
-
-          rm -f ~/.ssh/vps_key
       - name: Restart freebuff2api on VPS
         if: steps.changed.outputs.changed == 'true'
         env:
@@ -89,6 +73,6 @@ jobs:
 
           ssh -i ~/.ssh/vps_key \
             "$VPS_USER@$VPS_HOST" \
-            "docker restart freebuff2api"
+            "sudo docker restart freebuff2api"
 
           rm -f ~/.ssh/vps_key
