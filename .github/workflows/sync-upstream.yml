@@ -37,7 +37,7 @@ jobs:
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Fork is already up to date."
           else
-            git merge --no-edit upstream/main
+            git merge --no-edit -X theirs upstream/main
             git push origin main
           fi
 
