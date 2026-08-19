@@ -28,6 +28,9 @@ jobs:
 
       - name: Merge upstream
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git remote add upstream https://github.com/pingmike2/freebuff2api-wokers.git
           git fetch upstream main
 
