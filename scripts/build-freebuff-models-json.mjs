@@ -137,6 +137,25 @@ function parseModelPools(source, modelIdConstants) {
   return { premium: [...premium], glm: [...glm] };
 }
 
+// 官方暂停/下线模型（FREEBUFF_PAUSED_FREE_MODEL_IDS）：从快照剔除。
+// 官方保留 agent 映射只为排空已准入会话，admission 会 coerce/410，
+// 新会话请求这些模型必然失败，不应进入模型目录。
+function parsePausedModels(source, modelIdConstants) {
+  const paused = new Set();
+  const listRe = /export\s+const\s+FREEBUFF_PAUSED_FREE_MODEL_IDS\s*:?\s*[^=]*=\s*\[([^\]]*)\]/;
+  const listMatch = listRe.exec(source);
+  if (!listMatch) return paused;
+  const itemRe = /'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
+  let im;
+  while ((im = itemRe.exec(listMatch[1])) !== null) {
+    const lit = im[1] ?? im[2];
+    const expr = im[3];
+    if (lit) paused.add(lit);
+    else if (expr && modelIdConstants[expr]) paused.add(modelIdConstants[expr]);
+  }
+  return paused;
+}
+
 // ---- 拉取 ----
 
 async function fetchFirst(urls) {
@@ -179,16 +198,23 @@ async function main() {
       process.exit(1);
     }
     const pools = parseModelPools(modelsSrc, modelIdConstants);
-    const models = Object.entries(agentMappings.root).map(([modelId, rootAgent]) => ({
-      id: modelId,
-      session: modelId,
-      agent: rootAgent,
-      root_agent: rootAgent,
-      base3_agent: agentMappings.base3[modelId] || null,
-      reviewer_agent: agentMappings.reviewer[modelId] || null,
-      upstream: modelId,
-    }));
+    const paused = parsePausedModels(modelsSrc, modelIdConstants);
+    if (paused.size > 0) {
+      console.log(`ℹ️  官方暂停模型（已从快照剔除）: ${[...paused].join(", ")}`);
+    }
+    const models = Object.entries(agentMappings.root)
+      .map(([modelId, rootAgent]) => ({
+        id: modelId,
+        session: modelId,
+        agent: rootAgent,
+        root_agent: rootAgent,
+        base3_agent: agentMappings.base3[modelId] || null,
+        reviewer_agent: agentMappings.reviewer[modelId] || null,
+        upstream: modelId,
+      }))
+      .filter((m) => !paused.has(m.id));
     const premium = new Set(pools.premium);
+    for (const id of paused) premium.delete(id);
     const glm = new Set(pools.glm);
     const standard = models
       .map((m) => m.id)
