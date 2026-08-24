@@ -108,8 +108,7 @@ def _http(method: str, path: str, body=None, headers=None, query=None, timeout=R
         url += "?" + urllib.parse.urlencode(query)
     data = None
     hdrs = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+        "User-Agent": "ai-sdk/openai-compatible/1.0.25/codebuff",
         "Accept": "application/json",
     }
     if body is not None:
@@ -404,7 +403,7 @@ def cmd_chat(args):
     # 1) 先确保有 active session（官方门控：无 session → 428 waiting_room_required）
     model = args.model or MODEL_DEFAULT
     # 官方 SDK UA（free 模式识别依赖，浏览器 UA 会被拒）
-    sdk_ua = "ai-sdk/openai-compatible/0.0.141/codebuff"
+    sdk_ua = "ai-sdk/openai-compatible/1.0.25/codebuff"
     headers = {"Authorization": f"Bearer {tok}", "User-Agent": sdk_ua}
     status, sess, _ = _http("POST", "/api/v1/freebuff/session",
                             headers={**headers, "x-freebuff-model": model})

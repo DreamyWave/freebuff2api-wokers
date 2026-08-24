@@ -1,8 +1,10 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.10.1";
+const VERSION = "1.8.10.2";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
+const SDK_UA = "ai-sdk/openai-compatible/1.0.25/codebuff";
+const DESKTOP_UA = "Freebuff-CLI/0.0.138";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
 // 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
@@ -757,7 +759,8 @@ const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   const headers = {};
-  // 桌面版协议：不手动设置 User-Agent（fetch 默认），只带必要的业务头
+  // 桌面版协议：所有请求带 SDK User-Agent（free 模式识别依赖此 UA）
+  headers["User-Agent"] = SDK_UA;
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   Object.assign(headers, extraHeaders);
@@ -906,13 +909,13 @@ async function runNormalClientBehavior(token, clientFingerprint) {
         sessionId: crypto.randomUUID(),
         surface: "waiting_room",
         device: { os: "macos", timezone: "Asia/Shanghai", locale: "zh-CN" },
-        userAgent: "Freebuff-CLI/0.0.138",
-      }, { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+        userAgent: DESKTOP_UA,
+      }, { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
       const impUrl = ad.data && Array.isArray(ad.data.ads) && ad.data.ads[0] && ad.data.ads[0].impUrl;
       if (ad.status === 200 && impUrl) {
         await enqueueUp("POST", "/api/v1/ads/impression", token,
           { impUrl, mode: "free" },
-          { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+          { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
       }
     } catch (e) { failures.push("ads:" + String(e && e.message || e).slice(0, 80)); }
   }
